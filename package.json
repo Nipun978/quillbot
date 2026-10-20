@@ -1,0 +1,29 @@
+{
+  "name": "quillbot-cli",
+  "version": "1.0.0",
+  "description": "Interactive CLI Story Writing Agent with Local Hybrid RAG and Groq Inference",
+  "type": "module",
+  "bin": {
+    "quillbot": "./bin/quillbot.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node ./bin/quillbot.js",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.1.0",
+    "@inquirer/prompts": "^7.0.0",
+    "@lancedb/lancedb": "^0.15.0",
+    "apache-arrow": "^17.0.0",
+    "chalk": "^5.3.0",
+    "chokidar": "^4.0.0",
+    "dotenv": "^16.4.5",
+    "groq-sdk": "^0.8.0",
+    "marked": "^14.1.0",
+    "marked-terminal": "^7.2.0",
+    "ora": "^8.1.0"
+  }
+}
