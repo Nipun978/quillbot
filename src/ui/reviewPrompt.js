@@ -3,8 +3,52 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { select, input } from '@inquirer/prompts';
+import { createPrompt, useState, useKeypress, usePrefix, isEnterKey, isUpKey, isDownKey } from '@inquirer/core';
+import { input } from '@inquirer/prompts';
 import chalk from 'chalk';
+
+export const hotkeySelect = createPrompt((config, done) => {
+  const { message, choices = [] } = config;
+  const [active, setActive] = useState(0);
+  const prefix = usePrefix({ status: 'idle' });
+
+  useKeypress((key, rl) => {
+    // 1. Check single-letter hotkeys (e.g. a, r, e, p, d)
+    const char = (key.name || key.sequence || '').toLowerCase();
+    const matchedChoice = choices.find((c) => c.key && c.key.toLowerCase() === char);
+    if (matchedChoice) {
+      done(matchedChoice.value);
+      return;
+    }
+
+    // 2. Check Enter key
+    if (isEnterKey(key)) {
+      if (choices[active]) {
+        done(choices[active].value);
+      }
+      return;
+    }
+
+    // 3. Arrow navigation
+    if (isUpKey(key)) {
+      setActive((active - 1 + choices.length) % choices.length);
+    } else if (isDownKey(key)) {
+      setActive((active + 1) % choices.length);
+    }
+  });
+
+  const lines = [
+    `${prefix} ${chalk.bold(message)}`,
+    ...choices.map((c, idx) => {
+      const isSelected = idx === active;
+      const pointer = isSelected ? chalk.cyan('> ') : '  ';
+      return isSelected ? chalk.cyan.bold(`${pointer}${c.name}`) : `${pointer}${c.name}`;
+    }),
+    chalk.dim(`\nPress hotkey [${choices.filter((c) => c.key).map((c) => c.key.toUpperCase()).join('/')}] or ↑↓ navigate • ⏎ select`)
+  ];
+
+  return lines.join('\n');
+});
 
 export async function openInEditor(initialContent = '', preferredEditor = '') {
   const editor = preferredEditor || (process.platform === 'win32' ? 'notepad' : (process.env.EDITOR || 'nano'));
@@ -22,6 +66,12 @@ export async function openInEditor(initialContent = '', preferredEditor = '') {
     stdio: 'inherit',
     shell: isWin
   });
+
+  if (process.stdin.isTTY) {
+    try {
+      process.stdin.resume();
+    } catch {}
+  }
 
   if (spawnRes.error) {
     console.error(chalk.red(`Failed to launch editor "${editor}": ${spawnRes.error.message}`));
@@ -48,19 +98,27 @@ export async function promptReviewWorkflow({
   preferredEditor = ''
 }) {
   const choices = [
-    { name: '[A]ccept - Commit and proceed', value: 'accept' },
-    { name: '[R]etry  - Regenerate with revision feedback', value: 'retry' },
-    { name: '[E]dit   - Open in external editor', value: 'edit' }
+    { key: 'a', name: '[A]ccept - Commit and proceed', value: 'accept' },
+    { key: 'r', name: '[R]etry  - Regenerate with revision feedback', value: 'retry' },
+    { key: 'e', name: '[E]dit   - Open in external editor', value: 'edit' }
   ];
 
   if (allowPause) {
-    choices.push({ name: '[P]ause  - Save progress and return to prompt', value: 'pause' });
+    choices.push({ key: 'p', name: '[P]ause  - Save progress and return to prompt', value: 'pause' });
   }
 
-  const action = await select({
-    message: `Review ${itemLabel}:`,
-    choices
-  });
+  let action;
+  try {
+    action = await hotkeySelect({
+      message: `Review ${itemLabel}:`,
+      choices
+    });
+  } catch (err) {
+    if (err.name === 'ExitPromptError') {
+      return { action: allowPause ? 'pause' : 'accept', content: draftContent };
+    }
+    throw err;
+  }
 
   if (action === 'accept') {
     return { action: 'accept', content: draftContent };
@@ -77,14 +135,22 @@ export async function promptReviewWorkflow({
     const edited = await openInEditor(draftContent, preferredEditor);
     console.log(chalk.green(`\nSaved changes from editor.`));
     // Verify if user wants to accept the edited content or retry again
-    const postEditAction = await select({
-      message: 'Action with edited text:',
-      choices: [
-        { name: '[A]ccept edited version', value: 'accept' },
-        { name: '[R]e-edit in editor', value: 'edit_again' },
-        { name: '[D]iscard edits and keep original', value: 'discard' }
-      ]
-    });
+    let postEditAction;
+    try {
+      postEditAction = await hotkeySelect({
+        message: 'Action with edited text:',
+        choices: [
+          { key: 'a', name: '[A]ccept edited version', value: 'accept' },
+          { key: 'r', name: '[R]e-edit in editor', value: 'edit_again' },
+          { key: 'd', name: '[D]iscard edits and keep original', value: 'discard' }
+        ]
+      });
+    } catch (err) {
+      if (err.name === 'ExitPromptError') {
+        return { action: 'accept', content: draftContent };
+      }
+      throw err;
+    }
 
     if (postEditAction === 'edit_again') {
       return promptReviewWorkflow({
@@ -104,3 +170,4 @@ export async function promptReviewWorkflow({
 
   return { action: 'pause', content: draftContent };
 }
+

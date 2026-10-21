@@ -1,5 +1,6 @@
 import readline from 'node:readline/promises';
 import { select, input as promptInput } from '@inquirer/prompts';
+import { createPrompt, useState, useKeypress, isEnterKey } from '@inquirer/core';
 import chalk from 'chalk';
 import { printHelp, printBanner, createSpinner } from './renderer.js';
 import { loadState } from '../config/stateManager.js';
@@ -105,7 +106,37 @@ export async function resolveCommandArguments(selected, cwd) {
   return selected;
 }
 
-export function readReplInput(promptText) {
+export const replInputPrompt = createPrompt((config, done) => {
+  const [value, setValue] = useState('');
+
+  useKeypress((key, rl) => {
+    const isSlash = key.sequence === '/' || key.name === 'slash' || rl.line === '/';
+    // If user types '/' as the first character, trigger command dropdown menu immediately
+    if (isSlash && (!value || value === '/')) {
+      done({ isSlashMenu: true });
+      return;
+    }
+
+    if (isEnterKey(key)) {
+      const finalInput = (rl.line !== undefined && rl.line !== '') ? rl.line : value;
+      done({ input: finalInput.trim() });
+      return;
+    }
+
+    if (key.name === 'backspace') {
+      setValue(value.slice(0, -1));
+    } else if (key.sequence && key.sequence.length === 1 && !key.ctrl && !key.meta) {
+      setValue(rl.line ? rl.line : (value + key.sequence));
+    } else if (rl.line !== undefined) {
+      setValue(rl.line);
+    }
+  });
+
+  const promptPrefix = chalk.bold.hex('#7C3AED')('quillbot') + chalk.dim(' > ');
+  return `${promptPrefix}${value}`;
+});
+
+export async function readReplInput(promptText) {
   if (!process.stdin.isTTY) {
     const rl = readline.createInterface({
       input: process.stdin,
@@ -118,91 +149,23 @@ export function readReplInput(promptText) {
     });
   }
 
-  return new Promise((resolve) => {
-    // Ensure stream is active and not paused before reading
+  if (process.stdin.isTTY) {
     try {
       process.stdin.resume();
     } catch {}
+  }
 
-    process.stdout.write(promptText);
-    let buffer = '';
-
-    const cleanup = () => {
-      process.stdin.removeListener('data', onData);
-      if (process.stdin.isTTY) {
-        try {
-          process.stdin.setRawMode(false);
-        } catch {}
-      }
-      // CRITICAL: Do NOT call process.stdin.pause() here!
-      // Calling pause() halts libuv console event reading on Windows,
-      // which causes subsequent @inquirer prompts to freeze and become unresponsive to arrow keys/Enter.
-    };
-
-    const onData = (chunk) => {
-      const str = chunk.toString();
-
-      // Ctrl+C
-      if (str === '\u0003') {
-        cleanup();
-        process.stdout.write('\n');
-        process.exit(0);
-      }
-
-      // If user types '/' as the first character, trigger command dropdown menu immediately
-      if (str === '/' && buffer.length === 0) {
-        cleanup();
-        process.stdout.write('\n');
-        resolve({ isSlashMenu: true });
-        return;
-      }
-
-      // Enter key
-      if (str === '\r' || str === '\n') {
-        cleanup();
-        process.stdout.write('\n');
-        resolve({ input: buffer });
-        return;
-      }
-
-      // Backspace
-      if (str === '\u0008' || str === '\x7f') {
-        if (buffer.length > 0) {
-          buffer = buffer.slice(0, -1);
-          process.stdout.write('\b \b');
-        }
-        return;
-      }
-
-      // Ignore escape sequences like arrow keys during direct text entry
-      if (str.startsWith('\u001b')) {
-        return;
-      }
-
-      // Handle pasted strings containing line endings
-      if (str.includes('\r') || str.includes('\n')) {
-        const clean = str.replace(/[\r\n]/g, '');
-        buffer += clean;
-        cleanup();
-        process.stdout.write(clean + '\n');
-        resolve({ input: buffer });
-        return;
-      }
-
-      // Normal character typing
-      buffer += str;
-      process.stdout.write(str);
-    };
-
-    try {
-      process.stdin.setRawMode(true);
-    } catch {}
-    try {
-      process.stdin.resume();
-    } catch {}
-    process.stdin.on('data', onData);
-  });
+  try {
+    return await replInputPrompt({});
+  } catch (err) {
+    if (err.name === 'ExitPromptError') {
+      console.log(chalk.cyan('\nExiting Quillbot. Happy writing!'));
+      process.exit(0);
+    }
+    throw err;
+  }
 }
+
 
 export async function startRepl({
   cwd = process.cwd(),

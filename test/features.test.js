@@ -258,3 +258,56 @@ test('commitBeatToChapter preserves earlier beats and allows non-destructive rev
   }
 });
 
+test('hotkeySelect resolves instantly when single-character hotkeys (a, r, e, p) are pressed', async () => {
+  const { hotkeySelect } = await import('../src/ui/reviewPrompt.js');
+
+  const choices = [
+    { key: 'a', name: '[A]ccept', value: 'accept' },
+    { key: 'r', name: '[R]etry', value: 'retry' },
+    { key: 'e', name: '[E]dit', value: 'edit' },
+    { key: 'p', name: '[P]ause', value: 'pause' }
+  ];
+
+  // Test 'a' -> 'accept'
+  setTimeout(() => {
+    process.stdin.emit('keypress', 'a', { sequence: 'a', name: 'a' });
+  }, 30);
+  const resA = await hotkeySelect({ message: 'Review:', choices });
+  assert.equal(resA, 'accept');
+
+  // Test 'r' -> 'retry'
+  setTimeout(() => {
+    process.stdin.emit('keypress', 'r', { sequence: 'r', name: 'r' });
+  }, 30);
+  const resR = await hotkeySelect({ message: 'Review:', choices });
+  assert.equal(resR, 'retry');
+
+  // Test 'p' -> 'pause'
+  setTimeout(() => {
+    process.stdin.emit('keypress', 'p', { sequence: 'p', name: 'p' });
+  }, 30);
+  const resP = await hotkeySelect({ message: 'Review:', choices });
+  assert.equal(resP, 'pause');
+});
+
+test('replInputPrompt opens slash menu on slash and accepts text input on Enter', async () => {
+  const { replInputPrompt } = await import('../src/ui/repl.js');
+
+  // 1. Typing '/' immediately triggers isSlashMenu
+  setTimeout(() => {
+    process.stdin.emit('keypress', '/', { sequence: '/', name: 'slash' });
+  }, 30);
+  const slashRes = await replInputPrompt({});
+  assert.equal(slashRes.isSlashMenu, true);
+
+  // 2. Typing characters and pressing Enter returns input
+  setTimeout(() => {
+    process.stdin.emit('keypress', 'h', { sequence: 'h', name: 'h' });
+    process.stdin.emit('keypress', 'i', { sequence: 'i', name: 'i' });
+    process.stdin.emit('keypress', '\r', { name: 'return' });
+  }, 30);
+  const textRes = await replInputPrompt({});
+  assert.equal(textRes.input, 'hi');
+});
+
+
