@@ -29,15 +29,19 @@ export async function runBibleQuery({
 
   // If /bible is called without arguments, show an interactive submenu
   if (!trimmed) {
+    if (process.stdin.isTTY) {
+      try { process.stdin.resume(); } catch {}
+    }
+
     const action = await select({
       message: 'Story Bible Actions:',
       choices: [
-        { name: '📖 Consult Story Bible (Ask a question or inquire about lore)', value: 'consult' },
-        { name: '➕ Create a new Story Bible file (e.g. magic-system.md, factions.md)', value: 'create' },
-        { name: '✏️  Edit an existing Story Bible file (safely update without ruining lore)', value: 'edit' },
-        { name: '📋 List all Story Bible files and word counts', value: 'list' },
-        { name: '💾 Save lore decisions from recent conversation', value: 'save' },
-        { name: chalk.dim('← Back'), value: 'cancel' }
+        { name: `🔍 ${chalk.bold.cyan('Query Lore')} — Ask a question or search Story Bible canon`, value: 'query' },
+        { name: `➕ ${chalk.bold('Create File')} — Add a new Story Bible file (e.g. magic-system.md)`, value: 'create' },
+        { name: `✏️  ${chalk.bold('Edit File')} — Safely update/expand an existing Story Bible file`, value: 'edit' },
+        { name: `📋 ${chalk.bold('List Files')} — View all Story Bible documents and word counts`, value: 'list' },
+        { name: `💾 ${chalk.bold('Save Lore')} — Extract and save decisions from recent conversation`, value: 'save' },
+        { name: chalk.dim('← Back to prompt'), value: 'cancel' }
       ]
     });
 
@@ -55,9 +59,12 @@ export async function runBibleQuery({
       return handleBibleSave({ cwd, groqClient, vectorStore, embedder, conversationMgr, config });
     }
 
-    // Otherwise consult
+    // Otherwise query / consult
+    if (process.stdin.isTTY) {
+      try { process.stdin.resume(); } catch {}
+    }
     const q = await input({
-      message: 'Enter your question or lore query:'
+      message: 'Enter your lore query or question:'
     });
     if (!q || !q.trim()) return;
     query = q.trim();

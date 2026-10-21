@@ -35,6 +35,12 @@ export function completer(line) {
 }
 
 export async function showSlashCommandMenu() {
+  if (process.stdin.isTTY) {
+    try {
+      process.stdin.resume();
+    } catch {}
+  }
+
   const choices = [
     { name: `${chalk.bold.cyan('/init')}     ${chalk.dim('—')} Seed Story Bible from a synopsis`, value: '/init' },
     { name: `${chalk.bold.cyan('/bible')}    ${chalk.dim('—')} Consult Story Bible lore or /bible save`, value: '/bible' },
@@ -65,6 +71,40 @@ export async function showSlashCommandMenu() {
   }
 }
 
+export async function resolveCommandArguments(selected, cwd) {
+  if (process.stdin.isTTY) {
+    try {
+      process.stdin.resume();
+    } catch {}
+  }
+
+  if (selected === '/plan') {
+    const state = await loadState(cwd);
+    const ch = await promptInput({
+      message: 'Enter chapter number to plan:',
+      default: String(state.activeChapter || 1)
+    });
+    return `/plan ${ch.trim()}`;
+  } else if (selected === '/write') {
+    const state = await loadState(cwd);
+    const ch = await promptInput({
+      message: 'Enter chapter number to write:',
+      default: String(state.activeChapter || 1)
+    });
+    return `/write ${ch.trim()}`;
+  } else if (selected === '/bible') {
+    // Show the Story Bible menu directly with Query visible
+    return '/bible';
+  } else if (selected === '/chat') {
+    const msg = await promptInput({
+      message: 'Enter your message to chat with Story Bible & project RAG:'
+    });
+    return `/chat ${msg.trim()}`;
+  }
+
+  return selected;
+}
+
 export function readReplInput(promptText) {
   if (!process.stdin.isTTY) {
     const rl = readline.createInterface({
@@ -79,8 +119,25 @@ export function readReplInput(promptText) {
   }
 
   return new Promise((resolve) => {
+    // Ensure stream is active and not paused before reading
+    try {
+      process.stdin.resume();
+    } catch {}
+
     process.stdout.write(promptText);
     let buffer = '';
+
+    const cleanup = () => {
+      process.stdin.removeListener('data', onData);
+      if (process.stdin.isTTY) {
+        try {
+          process.stdin.setRawMode(false);
+        } catch {}
+      }
+      // CRITICAL: Do NOT call process.stdin.pause() here!
+      // Calling pause() halts libuv console event reading on Windows,
+      // which causes subsequent @inquirer prompts to freeze and become unresponsive to arrow keys/Enter.
+    };
 
     const onData = (chunk) => {
       const str = chunk.toString();
@@ -137,20 +194,12 @@ export function readReplInput(promptText) {
       process.stdout.write(str);
     };
 
-    const cleanup = () => {
-      process.stdin.removeListener('data', onData);
-      if (process.stdin.isTTY) {
-        try {
-          process.stdin.setRawMode(false);
-        } catch {}
-      }
-      process.stdin.pause();
-    };
-
     try {
       process.stdin.setRawMode(true);
     } catch {}
-    process.stdin.resume();
+    try {
+      process.stdin.resume();
+    } catch {}
     process.stdin.on('data', onData);
   });
 }
@@ -172,6 +221,12 @@ export async function startRepl({
 
   while (running) {
     try {
+      if (process.stdin.isTTY) {
+        try {
+          process.stdin.resume();
+        } catch {}
+      }
+
       const promptText = chalk.bold.hex('#7C3AED')('quillbot') + chalk.dim(' > ');
       const readResult = await readReplInput(promptText);
 
@@ -181,35 +236,7 @@ export async function startRepl({
         if (selected === '__cancel__') {
           continue;
         }
-
-        // Handle commands that need arguments
-        if (selected === '/plan') {
-          const state = await loadState(cwd);
-          const ch = await promptInput({
-            message: 'Enter chapter number to plan:',
-            default: String(state.activeChapter || 1)
-          });
-          input = `/plan ${ch.trim()}`;
-        } else if (selected === '/write') {
-          const state = await loadState(cwd);
-          const ch = await promptInput({
-            message: 'Enter chapter number to write:',
-            default: String(state.activeChapter || 1)
-          });
-          input = `/write ${ch.trim()}`;
-        } else if (selected === '/bible') {
-          const q = await promptInput({
-            message: 'Enter lore query or subcommand (create, edit, list, save, or press Enter for menu):'
-          });
-          input = q.trim() ? `/bible ${q.trim()}` : '/bible';
-        } else if (selected === '/chat') {
-          const msg = await promptInput({
-            message: 'Enter your message to chat with Story Bible & project RAG:'
-          });
-          input = `/chat ${msg.trim()}`;
-        } else {
-          input = selected;
-        }
+        input = await resolveCommandArguments(selected, cwd);
       } else {
         input = (readResult.input || '').trim();
       }
@@ -220,7 +247,7 @@ export async function startRepl({
       if (input === '/') {
         const selected = await showSlashCommandMenu();
         if (selected === '__cancel__') continue;
-        input = selected;
+        input = await resolveCommandArguments(selected, cwd);
       }
 
       // Handle Exit
@@ -250,6 +277,9 @@ export async function startRepl({
         console.log(chalk.bold.cyan('\n  Quillbot Novel Status:'));
         console.log(`  Project Title:      ${chalk.green(config.projectTitle || 'Untitled Novel')}`);
         console.log(`  Writing Style:      ${chalk.green(config.writingStyle || 'Default')}`);
+        if (config.enhancedWritingStyle) {
+          console.log(`  Enhanced Style:     ${chalk.green('Active (AI-Enhanced Guide incorporated)')}`);
+        }
         console.log(`  Active Chapter:     ${chalk.green(state.activeChapter || 1)}`);
         console.log(`  Active Beat:        ${chalk.green(state.activeBeat || 1)}`);
         console.log(`  Active Session:     ${chalk.green(conversationMgr.current?.id || 'none')}`);

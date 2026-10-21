@@ -157,12 +157,20 @@ test('configManager supports projectTitle and writingStyle in config and instruc
 
   const customInstr = buildInstructionsContent({
     projectTitle: 'Shadows of Havenbrook',
-    writingStyle: 'First-person, noir tone, cynical humor'
+    writingStyle: 'First-person, noir tone, cynical humor',
+    enhancedWritingStyle: '1. Narrative Point of View & Distance: Deep first-person with heavy cynical interiority filter.'
   });
 
   assert.ok(customInstr.includes('# Shadows of Havenbrook — Literary Prose & Pacing Instructions'));
-  assert.ok(customInstr.includes('## Author Writing Style Preferences & Tone'));
+  assert.ok(customInstr.includes('## Author Writing Style Preferences & Enhanced Prose Guide'));
+  assert.ok(customInstr.includes('Deep first-person with heavy cynical interiority filter.'));
   assert.ok(customInstr.includes('First-person, noir tone, cynical humor'));
+});
+
+test('repl resolveCommandArguments directly resolves /bible without prompting lore query', async () => {
+  const { resolveCommandArguments } = await import('../src/ui/repl.js');
+  const res = await resolveCommandArguments('/bible', process.cwd());
+  assert.equal(res, '/bible');
 });
 
 test('repl SLASH_COMMANDS includes /archive and autocompletes', () => {

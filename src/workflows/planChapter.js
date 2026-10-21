@@ -112,7 +112,18 @@ export async function runPlanChapterWorkflow({
     const planSpinner = createSpinner(`Drafting Beat Plan for Chapter ${chapterNum}...`).start();
 
     try {
+      const activeStyle = config.enhancedWritingStyle
+        ? `${config.enhancedWritingStyle}\n\nAuthor Core Preferences: ${config.writingStyle}`
+        : (config.writingStyle || '');
+
       const userPrompt = `${hierarchyXml}
+
+<writing_style_and_pacing_rules>
+Author's Writing Style & Tone Specification:
+${activeStyle || '(Standard literary prose guidelines)'}
+
+CRITICAL: Embody this exact tone, psychological depth, and stylistic pacing in every beat's Action and Goal/Hook description.
+</writing_style_and_pacing_rules>
 
 Target: Chapter ${chapterNum}
 Author Guidance / Core Conflict:

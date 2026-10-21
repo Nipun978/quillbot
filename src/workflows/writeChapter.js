@@ -241,12 +241,24 @@ export async function runWriteChapterWorkflow({
       rollingSummary: conversationMgr.getRollingSummary()
     });
 
-    // Static prefix: instructions + full plan
+    const activeStyle = config.enhancedWritingStyle
+      ? `${config.enhancedWritingStyle}\n\nAuthor Core Preferences: ${config.writingStyle}`
+      : (config.writingStyle || '');
+
+    // Static prefix: instructions + full plan + writing style rules
     const systemPrompt = `${hierarchyXml}
 
 <chapter_plan_static_prefix>
 ${planContent.trim()}
 </chapter_plan_static_prefix>
+
+<writing_style_rules>
+Author's Writing Style & Prose Requirements:
+${activeStyle || '(Standard literary prose guidelines)'}
+
+CRITICAL EXECUTION RULE:
+You must strictly embody and adhere to this exact writing style, narrative distance, voice, sentence rhythm, and sensory grounding when writing this beat.
+</writing_style_rules>
 
 ${WRITE_BEAT_SYSTEM_PROMPT}`;
 

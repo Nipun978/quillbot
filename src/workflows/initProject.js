@@ -16,26 +16,31 @@ export async function runInitProjectWorkflow({
   config
 }) {
   console.log(chalk.bold.cyan('\n  /init: Story in a Nutshell -> Story Bible Generator'));
-  console.log(chalk.dim('  Provide a project title, writing style preferences, and a short synopsis.'));
+  console.log(chalk.dim(`  Project: ${chalk.green(config.projectTitle || 'Untitled Novel')}`));
+  console.log(chalk.dim(`  Writing Style: ${chalk.green(config.writingStyle || 'Default')}`));
   console.log(chalk.dim('  Quillbot will generate characters.md, world-and-lore.md, locations.md, and plot-overview.md in structured paragraphs.\n'));
 
-  const projectTitle = await input({
-    message: 'Project / Novel Title:',
-    default: config.projectTitle || 'Untitled Novel'
-  });
+  // Only ask if not already configured
+  if (!config.projectTitle || !config.writingStyle) {
+    const projectTitle = await input({
+      message: 'Project / Novel Title:',
+      default: config.projectTitle || 'Untitled Novel'
+    });
 
-  const writingStyle = await input({
-    message: 'Writing Style Preferences (e.g., POV, tone, pacing, prose style):',
-    default: config.writingStyle || 'Third-person limited, atmospheric, psychologically nuanced, sensory-rich prose'
-  });
+    const writingStyle = await input({
+      message: 'Writing Style Preferences (e.g., POV, tone, pacing, prose style):',
+      default: config.writingStyle || 'Third-person limited, atmospheric, psychologically nuanced, sensory-rich prose'
+    });
 
-  config.projectTitle = projectTitle.trim() || 'Untitled Novel';
-  config.writingStyle = writingStyle.trim() || config.writingStyle;
-  await saveConfig(config, cwd);
-  await updateInstructionsFile(cwd, {
-    projectTitle: config.projectTitle,
-    writingStyle: config.writingStyle
-  });
+    config.projectTitle = projectTitle.trim() || 'Untitled Novel';
+    config.writingStyle = writingStyle.trim() || config.writingStyle;
+    await saveConfig(config, cwd);
+    await updateInstructionsFile(cwd, {
+      projectTitle: config.projectTitle,
+      writingStyle: config.writingStyle,
+      enhancedWritingStyle: config.enhancedWritingStyle
+    });
+  }
 
   const synopsis = await input({
     message: 'Paste or type your story premise / synopsis:'
@@ -45,6 +50,10 @@ export async function runInitProjectWorkflow({
     console.log(chalk.yellow('No synopsis provided. Aborting /init.'));
     return;
   }
+
+  const activeStyle = config.enhancedWritingStyle
+    ? `${config.enhancedWritingStyle}\n\n(Author Stated Preferences: ${config.writingStyle})`
+    : config.writingStyle;
 
   let currentFeedback = '';
   let accepted = false;
@@ -59,7 +68,8 @@ export async function runInitProjectWorkflow({
         {
           role: 'user',
           content: `Project Title: ${config.projectTitle}
-Writing Style Preferences: ${config.writingStyle}
+Writing Style Specification:
+${activeStyle}
 
 Story Synopsis:
 ${synopsis.trim()}` +
