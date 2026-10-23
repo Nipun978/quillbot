@@ -39,26 +39,27 @@ export function printBanner() {
 }
 
 export function printHelp() {
-  console.log(chalk.bold.yellow('\n  Quillbot Slash Commands:'));
+  console.log(chalk.bold.cyan('\n  Quillbot Interactive Command Reference:'));
+  console.log(chalk.dim('  Press "/" at the prompt to open the dropdown menu. Select a command and follow the prompts.\n'));
   const commands = [
-    ['/init', 'Seed Story Bible from a "Story in a Nutshell" synopsis'],
-    ['/bible [subcommand]', 'Consult lore, or /bible create, /bible edit, /bible list, /bible save'],
-    ['/plan <ch> [beat]', 'Plan or edit chapter beats (e.g. /plan 1 or /plan 1 2)'],
-    ['/write <ch> [beat]', 'Write or edit chapter/beat (e.g. /write 1 or /write 1 2)'],
-    ['/export [scope]', 'Export chapter, range (e.g. /export 1-3), or full manuscript'],
-    ['/chat [message]', 'Open conversational chat with Story Bible & project RAG'],
-    ['/archive', 'Archive active conversation and empty current.json'],
-    ['/load', 'Restore an archived conversation session'],
-    ['/new', 'Archive current conversation session and start fresh'],
-    ['/sync', 'Manually trigger incremental file sync to LanceDB'],
-    ['/config', 'View or update Quillbot configuration'],
-    ['/status', 'View current novel status, active chapter & beat'],
-    ['/help', 'Display this command reference'],
-    ['/exit', 'Exit the Quillbot CLI']
+    ['/write', 'Write or edit beats sequentially or targeted beat-by-beat'],
+    ['/plan', 'Plan or revise chapter beats, or add new beats'],
+    ['/bible', 'Query lore, create/edit bible files, list documents, or save lore'],
+    ['/export', 'Export specific chapter, range (e.g. 1-3), or entire manuscript'],
+    ['/chat', 'Conversational consultation with Story Bible and project context'],
+    ['/status', 'View active chapter, beat, tracked files, and chunk counts'],
+    ['/sync', 'Manually trigger incremental file sync to local hybrid index'],
+    ['/config', 'Launch interactive onboarding & settings wizard'],
+    ['/init', 'Seed Story Bible from a synopsis or story in a nutshell'],
+    ['/new', 'Start fresh conversation session (auto-archives existing)'],
+    ['/load', 'Restore an archived conversation session from dropdown'],
+    ['/archive', 'Archive current conversation session to disk'],
+    ['/help', 'Display this interactive command guide'],
+    ['/exit', 'Gracefully save and exit Quillbot']
   ];
 
   for (const [cmd, desc] of commands) {
-    console.log(`  ${chalk.cyan(cmd.padEnd(18))} ${chalk.white(desc)}`);
+    console.log(`  ${chalk.cyan(cmd.padEnd(14))} ${chalk.white(desc)}`);
   }
   console.log('');
 }

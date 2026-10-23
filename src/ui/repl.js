@@ -45,19 +45,19 @@ export async function showSlashCommandMenu() {
   }
 
   const choices = [
-    { name: `${chalk.bold.cyan('/init')}     ${chalk.dim('—')} Seed Story Bible from a synopsis`, value: '/init' },
-    { name: `${chalk.bold.cyan('/bible')}    ${chalk.dim('—')} Consult Story Bible lore or /bible save`, value: '/bible' },
-    { name: `${chalk.bold.cyan('/plan')}     ${chalk.dim('—')} Plan or edit chapter beats (e.g. /plan 1 or /plan 1 2)`, value: '/plan' },
     { name: `${chalk.bold.cyan('/write')}    ${chalk.dim('—')} Write or edit chapter beat-by-beat`, value: '/write' },
+    { name: `${chalk.bold.cyan('/plan')}     ${chalk.dim('—')} Plan or edit chapter beats (full chapter or single beat)`, value: '/plan' },
+    { name: `${chalk.bold.cyan('/bible')}    ${chalk.dim('—')} Story Bible lore & files (query, create, edit, list, save)`, value: '/bible' },
     { name: `${chalk.bold.cyan('/export')}   ${chalk.dim('—')} Export chapter, range (e.g. 1-3), or manuscript`, value: '/export' },
     { name: `${chalk.bold.cyan('/chat')}     ${chalk.dim('—')} Conversational chat with Story Bible RAG`, value: '/chat' },
-    { name: `${chalk.bold.cyan('/archive')}  ${chalk.dim('—')} Archive active conversation & empty current.json`, value: '/archive' },
-    { name: `${chalk.bold.cyan('/load')}     ${chalk.dim('—')} Restore an archived conversation session`, value: '/load' },
-    { name: `${chalk.bold.cyan('/new')}      ${chalk.dim('—')} Start fresh session (auto-archives existing)`, value: '/new' },
+    { name: `${chalk.bold.cyan('/status')}   ${chalk.dim('—')} View active chapter, beat, and novel statistics`, value: '/status' },
     { name: `${chalk.bold.cyan('/sync')}     ${chalk.dim('—')} Manually trigger incremental sync to LanceDB`, value: '/sync' },
-    { name: `${chalk.bold.cyan('/config')}   ${chalk.dim('—')} View or update Quillbot configuration`, value: '/config' },
-    { name: `${chalk.bold.cyan('/status')}   ${chalk.dim('—')} View active chapter, beat and status`, value: '/status' },
-    { name: `${chalk.bold.cyan('/help')}     ${chalk.dim('—')} Display command reference`, value: '/help' },
+    { name: `${chalk.bold.cyan('/config')}   ${chalk.dim('—')} View or update Quillbot configuration wizard`, value: '/config' },
+    { name: `${chalk.bold.cyan('/init')}     ${chalk.dim('—')} Seed Story Bible from a synopsis`, value: '/init' },
+    { name: `${chalk.bold.cyan('/new')}      ${chalk.dim('—')} Start fresh session (auto-archives existing)`, value: '/new' },
+    { name: `${chalk.bold.cyan('/load')}     ${chalk.dim('—')} Restore an archived conversation session`, value: '/load' },
+    { name: `${chalk.bold.cyan('/archive')}  ${chalk.dim('—')} Archive active conversation & empty current.json`, value: '/archive' },
+    { name: `${chalk.bold.cyan('/help')}     ${chalk.dim('—')} Display command reference & dropdown guide`, value: '/help' },
     { name: `${chalk.bold.red('/exit')}     ${chalk.dim('—')} Exit Quillbot`, value: '/exit' },
     { name: chalk.dim('← Cancel / Back to conversation'), value: '__cancel__' }
   ];
@@ -84,49 +84,88 @@ export async function resolveCommandArguments(selected, cwd) {
 
   if (selected === '/plan') {
     const state = await loadState(cwd);
-    const ch = await promptInput({
-      message: 'Enter chapter number to plan:',
-      default: String(state.activeChapter || 1)
-    });
-    const beat = await promptInput({
-      message: 'Target Beat number (press Enter to plan/edit whole chapter, or enter beat number e.g. 1, 2, or "add"):',
-      default: ''
-    });
+    let ch = String(state.activeChapter || 1);
+    if (process.stdin.isTTY) {
+      try {
+        ch = await promptInput({
+          message: 'Enter chapter number to plan:',
+          default: String(state.activeChapter || 1)
+        });
+      } catch {}
+    }
+    let beat = '';
+    if (process.stdin.isTTY) {
+      try {
+        beat = await promptInput({
+          message: 'Target Beat number (press Enter to plan/edit whole chapter, or enter beat number e.g. 1, 2, or "add"):',
+          default: ''
+        });
+      } catch {}
+    }
     if (beat && beat.trim()) {
       return `/plan ${ch.trim()} ${beat.trim()}`;
     }
     return `/plan ${ch.trim()}`;
   } else if (selected === '/write') {
     const state = await loadState(cwd);
-    const ch = await promptInput({
-      message: 'Enter chapter number to write:',
-      default: String(state.activeChapter || 1)
-    });
-    const beat = await promptInput({
-      message: 'Target Beat number (press Enter to auto-resume or enter edit mode if complete):',
-      default: ''
-    });
+    let ch = String(state.activeChapter || 1);
+    if (process.stdin.isTTY) {
+      try {
+        ch = await promptInput({
+          message: 'Enter chapter number to write:',
+          default: String(state.activeChapter || 1)
+        });
+      } catch {}
+    }
+    let beat = '';
+    if (process.stdin.isTTY) {
+      try {
+        beat = await promptInput({
+          message: 'Target Beat number (press Enter to write in sequence / auto-resume, or enter beat number e.g. 1 to edit):',
+          default: ''
+        });
+      } catch {}
+    }
     if (beat && beat.trim()) {
       return `/write ${ch.trim()} ${beat.trim()}`;
     }
     return `/write ${ch.trim()}`;
   } else if (selected === '/export') {
-    const scope = await promptInput({
-      message: 'Enter chapter number or range to export (e.g. 1, 1-3, or press Enter for all):',
-      default: ''
-    });
-    if (scope && scope.trim()) {
-      return `/export ${scope.trim()}`;
+    let scope = '';
+    let format = 'md';
+    if (process.stdin.isTTY) {
+      try {
+        scope = await promptInput({
+          message: 'Enter chapter number or range to export (e.g. 1, 1-3, or press Enter for all):',
+          default: ''
+        });
+        format = await select({
+          message: 'Select export format:',
+          choices: [
+            { name: 'Markdown (.md) — Complete formatted manuscript', value: 'md' },
+            { name: 'Plain Text (.txt) — Clean plain text manuscript', value: 'txt' }
+          ]
+        });
+      } catch {
+        format = 'md';
+      }
     }
-    return '/export';
+    const scopePart = scope && scope.trim() ? scope.trim() : 'all';
+    const formatFlag = format === 'txt' ? ' txt' : '';
+    return `/export ${scopePart}${formatFlag}`;
   } else if (selected === '/bible') {
-    // Show the Story Bible menu directly with Query visible
+    // Show the Story Bible menu directly with Query, Create, Edit, List, Save
     return '/bible';
   } else if (selected === '/chat') {
-    const msg = await promptInput({
-      message: 'Enter your message to chat with Story Bible & project RAG:'
-    });
-    return `/chat ${msg.trim()}`;
+    let msg = '';
+    if (process.stdin.isTTY) {
+      try {
+        msg = await promptInput({
+          message: 'Enter your message to chat with Story Bible & project RAG:'
+        });
+      } catch {}
+    }
+    return `/chat ${(msg || '').trim()}`;
   }
 
   return selected;
@@ -136,15 +175,20 @@ export const replInputPrompt = createPrompt((config, done) => {
   const [value, setValue] = useState('');
 
   useKeypress((key, rl) => {
-    const isSlash = key.sequence === '/' || key.name === 'slash' || rl.line === '/';
-    // If user types '/' as the first character, trigger command dropdown menu immediately
-    if (isSlash && (!value || value === '/')) {
+    const isSlash = key.sequence === '/' || key.name === 'slash' || key.sequence?.includes('/') || rl.line?.startsWith('/');
+    // As soon as '/' is pressed or present, trigger command dropdown menu immediately (no speed typing)
+    if (isSlash) {
       done({ isSlashMenu: true });
       return;
     }
 
     if (isEnterKey(key)) {
       const finalInput = (rl.line !== undefined && rl.line !== '') ? rl.line : value;
+      // If user submitted an input starting with '/', intercept and trigger command dropdown menu
+      if (finalInput.trim().startsWith('/')) {
+        done({ isSlashMenu: true });
+        return;
+      }
       done({ input: finalInput.trim() });
       return;
     }
@@ -204,7 +248,7 @@ export async function startRepl({
   watcher
 }) {
   printBanner();
-  console.log(chalk.dim('Type ') + chalk.cyan('/') + chalk.dim(' for dropdown menu, ') + chalk.cyan('/help') + chalk.dim(' for commands, or type freely to chat.\n'));
+  console.log(chalk.dim('Press ') + chalk.bold.cyan('/') + chalk.dim(' anytime to open the command dropdown menu, or type freely to consult lore / chat.\n'));
 
   let running = true;
 
@@ -220,24 +264,20 @@ export async function startRepl({
       const readResult = await readReplInput(promptText);
 
       let input = '';
-      if (readResult.isSlashMenu) {
+      const rawTrimmed = (readResult.input || '').trim();
+
+      // Whenever slash is entered (or input starts with '/'), ALWAYS route to dropdown menu
+      if (readResult.isSlashMenu || rawTrimmed.startsWith('/')) {
         const selected = await showSlashCommandMenu();
         if (selected === '__cancel__') {
           continue;
         }
         input = await resolveCommandArguments(selected, cwd);
       } else {
-        input = (readResult.input || '').trim();
+        input = rawTrimmed;
       }
 
       if (!input) continue;
-
-      // If user typed only "/", open dropdown menu
-      if (input === '/') {
-        const selected = await showSlashCommandMenu();
-        if (selected === '__cancel__') continue;
-        input = await resolveCommandArguments(selected, cwd);
-      }
 
       // Handle Exit
       if (input === '/exit' || input.toLowerCase() === 'exit' || input === '/quit' || input.toLowerCase() === 'quit') {

@@ -133,7 +133,10 @@ test('fileSync tracks hashes and indexes files incrementally', async () => {
 
     const store = new VectorStore({}, tmpDir);
     await store.init();
-    const embedder = new OllamaEmbedder();
+    const embedder = {
+      embedTexts: async (texts) => texts.map(() => new Array(768).fill(0.05)),
+      embedQuery: async () => new Array(768).fill(0.05)
+    };
 
     const syncRes = await syncAllFiles({
       cwd: tmpDir,

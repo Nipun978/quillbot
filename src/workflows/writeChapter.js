@@ -319,7 +319,21 @@ export async function runWriteChapterWorkflow({
   }
 
   if (isNaN(chapterNum) || chapterNum < 1) {
-    console.log(chalk.yellow('Usage: /write <chapter_number> [beat_number] (e.g. /write 1 or /write 1 2)'));
+    if (process.stdin.isTTY) {
+      try {
+        const { input } = await import('@inquirer/prompts');
+        const state = await loadState(cwd);
+        const chInput = await input({
+          message: 'Enter chapter number to write:',
+          default: String(state.activeChapter || 1)
+        });
+        chapterNum = parseInt(chInput, 10);
+      } catch {}
+    }
+  }
+
+  if (isNaN(chapterNum) || chapterNum < 1) {
+    console.log(chalk.yellow('Please specify a valid chapter number to write.'));
     return;
   }
 

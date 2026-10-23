@@ -105,6 +105,7 @@ export function parseChapterSelection(arg = '') {
   if (!arg || typeof arg !== 'string') return null;
   const clean = arg
     .replace(/--(?:txt|scene-breaks?)/gi, '')
+    .replace(/\b(?:txt|md)\b/gi, '')
     .trim();
 
   if (!clean || clean.toLowerCase() === 'all') return null;
@@ -136,14 +137,14 @@ export function parseChapterSelection(arg = '') {
  * Main export workflow: compiles all or selected chapter manuscripts into exports/
  */
 export async function runExportWorkflow({
-  arg = '',
+  arg,
   cwd = process.cwd(),
   config = {}
 }) {
   let currentArg = arg;
 
-  // If no arguments provided and running in interactive terminal, prompt for chapter or range
-  if ((!currentArg || !currentArg.trim()) && process.stdin.isTTY) {
+  // If no arguments provided at all and running in interactive terminal, prompt for chapter or range
+  if (currentArg === undefined && process.stdin.isTTY) {
     try {
       const { input } = await import('@inquirer/prompts');
       const selectedScope = await input({
@@ -152,8 +153,13 @@ export async function runExportWorkflow({
       });
       if (selectedScope && selectedScope.trim()) {
         currentArg = selectedScope.trim();
+      } else {
+        currentArg = '';
       }
     } catch {}
+  }
+  if (currentArg === undefined) {
+    currentArg = '';
   }
 
   const isTxt = Boolean(currentArg && (currentArg.toLowerCase().includes('txt') || currentArg.toLowerCase().includes('--txt')));

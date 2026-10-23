@@ -321,7 +321,20 @@ export async function runPlanChapterWorkflow({
   }
 
   if (isNaN(chapterNum) || chapterNum < 1) {
-    console.log(chalk.yellow('Usage: /plan <chapter_number> [beat_number] (e.g. /plan 1 or /plan 1 2)'));
+    if (process.stdin.isTTY) {
+      try {
+        const state = await loadState(cwd);
+        const chInput = await input({
+          message: 'Enter chapter number to plan:',
+          default: String(state.activeChapter || 1)
+        });
+        chapterNum = parseInt(chInput, 10);
+      } catch {}
+    }
+  }
+
+  if (isNaN(chapterNum) || chapterNum < 1) {
+    console.log(chalk.yellow('Please specify a valid chapter number to plan.'));
     return;
   }
 

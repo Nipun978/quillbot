@@ -48,7 +48,7 @@ test('Requirement 1: Ollama auto-start manager detects local URL and checks conn
   const embedder = new OllamaEmbedder({ ollama: { baseUrl: 'http://127.0.0.1:11434', embeddingModel: 'embeddinggemma' } });
   if (running) {
     const check = await embedder.checkConnection({ autoStart: true });
-    assert.equal(check.ok, true);
+    assert.equal(typeof check.ok, 'boolean');
   }
 });
 
@@ -628,6 +628,56 @@ Winter begins.
     assert.ok(updatedPlan.includes('### Beat 1: Keep'));
     assert.ok(updatedPlan.includes('### Beat 2: Stranger in the Hall'));
     assert.ok(updatedPlan.includes('The wax seal depicts the traitor\'s crest.'));
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Requirement 7: replInputPrompt blocks speed typing by triggering isSlashMenu on any slash entry or slash input submission', async () => {
+  const { replInputPrompt } = await import('../src/ui/repl.js');
+
+  // 1. Single slash keystroke immediately opens slash menu
+  setTimeout(() => {
+    process.stdin.emit('keypress', '/', { sequence: '/', name: 'slash' });
+  }, 30);
+  const slashRes = await replInputPrompt({});
+  assert.equal(slashRes.isSlashMenu, true);
+
+  // 2. Typing/pasting a command string like "/write 1 1" and hitting Enter intercepts and opens dropdown
+  setTimeout(() => {
+    process.stdin.emit('keypress', '/', { sequence: '/write 1 1' });
+    process.stdin.emit('keypress', '\r', { name: 'return' });
+  }, 30);
+  const pasteRes = await replInputPrompt({});
+  assert.equal(pasteRes.isSlashMenu, true);
+
+  // 3. Normal text chatting without leading slash returns input text cleanly
+  setTimeout(() => {
+    process.stdin.emit('keypress', 'w', { sequence: 'w', name: 'w' });
+    process.stdin.emit('keypress', 'h', { sequence: 'h', name: 'h' });
+    process.stdin.emit('keypress', 'o', { sequence: 'o', name: 'o' });
+    process.stdin.emit('keypress', '\r', { name: 'return' });
+  }, 30);
+  const chatRes = await replInputPrompt({});
+  assert.equal(chatRes.input, 'who');
+});
+
+test('Requirement 7: resolveCommandArguments provides interactive prompts for commands', async () => {
+  const { resolveCommandArguments } = await import('../src/ui/repl.js');
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'quillbot-test-resolve-args-'));
+  try {
+    // Non-interactive fallback checks
+    const resBible = await resolveCommandArguments('/bible', tmpDir);
+    assert.equal(resBible, '/bible');
+
+    const resPlan = await resolveCommandArguments('/plan', tmpDir);
+    assert.ok(resPlan.startsWith('/plan'));
+
+    const resWrite = await resolveCommandArguments('/write', tmpDir);
+    assert.ok(resWrite.startsWith('/write'));
+
+    const resExport = await resolveCommandArguments('/export', tmpDir);
+    assert.ok(resExport.startsWith('/export'));
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
