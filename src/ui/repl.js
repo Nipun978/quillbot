@@ -8,6 +8,7 @@ import { runInitProjectWorkflow } from '../workflows/initProject.js';
 import { runBibleQuery } from '../workflows/chatBible.js';
 import { runPlanChapterWorkflow } from '../workflows/planChapter.js';
 import { runWriteChapterWorkflow } from '../workflows/writeChapter.js';
+import { runExportWorkflow } from '../workflows/exportManuscript.js';
 import { syncAllFiles, getTrackedFiles } from '../rag/fileSync.js';
 import { runOnboardingWizard } from '../config/configManager.js';
 
@@ -16,6 +17,7 @@ export const SLASH_COMMANDS = [
   '/bible',
   '/plan',
   '/write',
+  '/export',
   '/chat',
   '/archive',
   '/load',
@@ -47,6 +49,7 @@ export async function showSlashCommandMenu() {
     { name: `${chalk.bold.cyan('/bible')}    ${chalk.dim('—')} Consult Story Bible lore or /bible save`, value: '/bible' },
     { name: `${chalk.bold.cyan('/plan')}     ${chalk.dim('—')} Plan chapter into structured beats`, value: '/plan' },
     { name: `${chalk.bold.cyan('/write')}    ${chalk.dim('—')} Write chapter beat-by-beat`, value: '/write' },
+    { name: `${chalk.bold.cyan('/export')}   ${chalk.dim('—')} Compile all chapters into clean manuscript`, value: '/export' },
     { name: `${chalk.bold.cyan('/chat')}     ${chalk.dim('—')} Conversational chat with Story Bible RAG`, value: '/chat' },
     { name: `${chalk.bold.cyan('/archive')}  ${chalk.dim('—')} Archive active conversation & empty current.json`, value: '/archive' },
     { name: `${chalk.bold.cyan('/load')}     ${chalk.dim('—')} Restore an archived conversation session`, value: '/load' },
@@ -92,7 +95,16 @@ export async function resolveCommandArguments(selected, cwd) {
       message: 'Enter chapter number to write:',
       default: String(state.activeChapter || 1)
     });
+    const beat = await promptInput({
+      message: 'Target Beat number (press Enter to auto-resume from next unwritten beat):',
+      default: ''
+    });
+    if (beat && beat.trim()) {
+      return `/write ${ch.trim()} ${beat.trim()}`;
+    }
     return `/write ${ch.trim()}`;
+  } else if (selected === '/export') {
+    return '/export';
   } else if (selected === '/bible') {
     // Show the Story Bible menu directly with Query visible
     return '/bible';
@@ -344,6 +356,17 @@ export async function startRepl({
           embedder,
           reranker,
           conversationMgr,
+          config
+        });
+        continue;
+      }
+
+      // Handle Export
+      if (input.startsWith('/export')) {
+        const arg = input.slice(7).trim();
+        await runExportWorkflow({
+          arg,
+          cwd,
           config
         });
         continue;

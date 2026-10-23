@@ -95,13 +95,22 @@ export async function promptReviewWorkflow({
   draftContent = '',
   itemLabel = 'draft',
   allowPause = true,
-  preferredEditor = ''
+  preferredEditor = '',
+  criticIssues = []
 }) {
   const choices = [
     { key: 'a', name: '[A]ccept - Commit and proceed', value: 'accept' },
     { key: 'r', name: '[R]etry  - Regenerate with revision feedback', value: 'retry' },
     { key: 'e', name: '[E]dit   - Open in external editor', value: 'edit' }
   ];
+
+  if (criticIssues && criticIssues.length > 0) {
+    choices.push({
+      key: 'f',
+      name: '[F]ix    - Auto-regenerate beat fixing Continuity Critic issues',
+      value: 'fix_critic'
+    });
+  }
 
   if (allowPause) {
     choices.push({ key: 'p', name: '[P]ause  - Save progress and return to prompt', value: 'pause' });
@@ -122,6 +131,21 @@ export async function promptReviewWorkflow({
 
   if (action === 'accept') {
     return { action: 'accept', content: draftContent };
+  }
+
+  if (action === 'fix_critic') {
+    const formattedCriticFixInstructions = criticIssues.map((issue, idx) => {
+      const typeStr = issue.type ? `[${issue.type}] ` : '';
+      const quoteStr = issue.quote ? `\n- Quote: "${issue.quote}"` : '';
+      const fixStr = issue.fixSuggestion ? `\n- Fix: ${issue.fixSuggestion}` : '';
+      return `${idx + 1}. ${typeStr}${issue.description}${quoteStr}${fixStr}`;
+    }).join('\n\n');
+
+    return {
+      action: 'retry',
+      content: draftContent,
+      feedback: `Please fix the following continuity issues detected by Continuity Critic:\n\n${formattedCriticFixInstructions}`
+    };
   }
 
   if (action === 'retry') {
@@ -157,7 +181,8 @@ export async function promptReviewWorkflow({
         draftContent: edited,
         itemLabel,
         allowPause,
-        preferredEditor
+        preferredEditor,
+        criticIssues
       });
     }
 

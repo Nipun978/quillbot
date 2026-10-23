@@ -100,7 +100,8 @@ export function getDefaultConfig() {
       temperaturePlan: 0.6,
       temperatureWrite: 0.75,
       continuityTailWords: 350,
-      slidingChatWindowTurns: 8
+      slidingChatWindowTurns: 8,
+      enableContinuityCritic: true
     },
     editor: defaultEditor
   };

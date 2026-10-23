@@ -45,6 +45,7 @@ export function printHelp() {
     ['/bible [subcommand]', 'Consult lore, or /bible create, /bible edit, /bible list, /bible save'],
     ['/plan <chapter>', 'Generate structured beat plan for chapter (e.g. /plan 1)'],
     ['/write <chapter>', 'Write chapter beat-by-beat with Accept / Retry / Edit'],
+    ['/export [txt]', 'Compile all chapters into clean manuscript in exports/'],
     ['/chat [message]', 'Open conversational chat with Story Bible & project RAG'],
     ['/archive', 'Archive active conversation and empty current.json'],
     ['/load', 'Restore an archived conversation session'],
