@@ -92,15 +92,73 @@ export function assembleManuscript({
 }
 
 /**
- * Main export workflow: compiles all chapter manuscripts into exports/
+ * Parses chapter numbers or ranges from an export argument string.
+ * Examples:
+ *   "1" -> [1]
+ *   "1-3" -> [1, 2, 3]
+ *   "2..4" -> [2, 3, 4]
+ *   "1, 3, 5" -> [1, 3, 5]
+ *   "chapter 2" -> [2]
+ *   "" or "all" -> null (all chapters)
+ */
+export function parseChapterSelection(arg = '') {
+  if (!arg || typeof arg !== 'string') return null;
+  const clean = arg
+    .replace(/--(?:txt|scene-breaks?)/gi, '')
+    .trim();
+
+  if (!clean || clean.toLowerCase() === 'all') return null;
+
+  // Check for range: e.g. "1-3", "1 to 3", "1..3", "chapter 1-3"
+  const rangeMatch = clean.match(/(?:chapters?\s*)?(\d+)\s*(?:-|to|\.\.)\s*(\d+)/i);
+  if (rangeMatch) {
+    const start = parseInt(rangeMatch[1], 10);
+    const end = parseInt(rangeMatch[2], 10);
+    const min = Math.min(start, end);
+    const max = Math.max(start, end);
+    const nums = [];
+    for (let i = min; i <= max; i++) {
+      nums.push(i);
+    }
+    return nums;
+  }
+
+  // Check for comma or whitespace separated list of chapter numbers
+  const numMatches = clean.match(/\b\d+\b/g);
+  if (numMatches && numMatches.length > 0) {
+    return [...new Set(numMatches.map((n) => parseInt(n, 10)))].sort((a, b) => a - b);
+  }
+
+  return null;
+}
+
+/**
+ * Main export workflow: compiles all or selected chapter manuscripts into exports/
  */
 export async function runExportWorkflow({
   arg = '',
   cwd = process.cwd(),
   config = {}
 }) {
-  const isTxt = Boolean(arg && (arg.toLowerCase().includes('txt') || arg.toLowerCase().includes('--txt')));
-  const useSceneBreaks = Boolean(arg && (arg.toLowerCase().includes('scene-break') || arg.toLowerCase().includes('--scene-breaks')));
+  let currentArg = arg;
+
+  // If no arguments provided and running in interactive terminal, prompt for chapter or range
+  if ((!currentArg || !currentArg.trim()) && process.stdin.isTTY) {
+    try {
+      const { input } = await import('@inquirer/prompts');
+      const selectedScope = await input({
+        message: 'Chapter number or range to export (e.g. 1, 1-3, or press Enter for all):',
+        default: ''
+      });
+      if (selectedScope && selectedScope.trim()) {
+        currentArg = selectedScope.trim();
+      }
+    } catch {}
+  }
+
+  const isTxt = Boolean(currentArg && (currentArg.toLowerCase().includes('txt') || currentArg.toLowerCase().includes('--txt')));
+  const useSceneBreaks = Boolean(currentArg && (currentArg.toLowerCase().includes('scene-break') || currentArg.toLowerCase().includes('--scene-breaks')));
+  const targetChapterNums = parseChapterSelection(currentArg);
 
   const projectDir = path.join(cwd, 'project');
   let entries = [];
@@ -129,9 +187,20 @@ export async function runExportWorkflow({
     return null;
   }
 
+  // Filter chapters if specific chapter or range was requested
+  let activeChapterDirs = chapterDirs;
+  if (targetChapterNums && targetChapterNums.length > 0) {
+    activeChapterDirs = chapterDirs.filter((ch) => targetChapterNums.includes(ch.num));
+    if (activeChapterDirs.length === 0) {
+      console.log(chalk.yellow(`\nNo matching chapters found in project/ for selection '${currentArg}'.`));
+      console.log(chalk.dim(`Available chapters: ${chapterDirs.map((ch) => ch.num).join(', ')}`));
+      return null;
+    }
+  }
+
   const compiledChapters = [];
 
-  for (const ch of chapterDirs) {
+  for (const ch of activeChapterDirs) {
     const chapterFile = path.join(ch.fullPath, 'chapter.md');
     const planFile = path.join(ch.fullPath, 'plan.md');
 
@@ -182,7 +251,14 @@ export async function runExportWorkflow({
 
   const sanitized = sanitizeTitle(projectTitle);
   const ext = isTxt ? 'txt' : 'md';
-  const fileName = `${sanitized}-manuscript.${ext}`;
+  let fileName = `${sanitized}-manuscript.${ext}`;
+  if (targetChapterNums && targetChapterNums.length === 1) {
+    fileName = `${sanitized}-chapter-${String(targetChapterNums[0]).padStart(2, '0')}.${ext}`;
+  } else if (targetChapterNums && targetChapterNums.length > 1) {
+    const minCh = Math.min(...targetChapterNums);
+    const maxCh = Math.max(...targetChapterNums);
+    fileName = `${sanitized}-chapters-${String(minCh).padStart(2, '0')}-to-${String(maxCh).padStart(2, '0')}.${ext}`;
+  }
   const outputPath = path.join(exportDir, fileName);
 
   await fs.writeFile(outputPath, fullText, 'utf8');

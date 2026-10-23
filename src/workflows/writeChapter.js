@@ -67,11 +67,60 @@ export function getFirstNWords(text = '', count = 150) {
   return words.slice(0, count).join(' ');
 }
 
+/**
+ * Parses chapter.md content into an optional header and a Map of beat numbers to prose.
+ */
+export function parseChapterBeats(rawContent = '') {
+  if (!rawContent || !rawContent.trim()) {
+    return { header: '# Chapter Manuscript', beatsMap: new Map() };
+  }
+
+  const beatMarkerRegex = /<!-- BEAT (\d+) -->/g;
+  const matches = [...rawContent.matchAll(beatMarkerRegex)];
+
+  if (matches.length === 0) {
+    return { header: rawContent.trim(), beatsMap: new Map() };
+  }
+
+  const header = rawContent.slice(0, matches[0].index).trim();
+  const beatsMap = new Map();
+
+  for (let i = 0; i < matches.length; i++) {
+    const num = parseInt(matches[i][1], 10);
+    const startIdx = matches[i].index + matches[i][0].length;
+    const endIdx = (i < matches.length - 1) ? matches[i + 1].index : rawContent.length;
+    const prose = rawContent.slice(startIdx, endIdx).trim();
+    beatsMap.set(num, prose);
+  }
+
+  return { header, beatsMap };
+}
+
+/**
+ * Serializes the header and beatsMap into chapter.md markdown,
+ * ensuring all beats are written strictly in ascending numerical order.
+ */
+export function serializeChapterBeats(header = '# Chapter Manuscript', beatsMap = new Map()) {
+  const sortedNums = Array.from(beatsMap.keys()).sort((a, b) => a - b);
+  const beatBlocks = sortedNums.map((num) => {
+    return `<!-- BEAT ${num} -->\n${beatsMap.get(num).trim()}`;
+  });
+
+  const cleanHeader = (header || '# Chapter Manuscript').trim();
+  if (beatBlocks.length === 0) {
+    return cleanHeader ? `${cleanHeader}\n` : '';
+  }
+
+  return cleanHeader
+    ? `${cleanHeader}\n\n${beatBlocks.join('\n\n')}\n`
+    : `${beatBlocks.join('\n\n')}\n`;
+}
+
 export async function getCompletedBeatsInChapter(chapterFilePath) {
   try {
     const content = await fs.readFile(chapterFilePath, 'utf8');
-    const matches = [...content.matchAll(/<!-- BEAT (\d+) -->/g)];
-    const completedNums = matches.map((m) => parseInt(m[1], 10));
+    const { beatsMap } = parseChapterBeats(content);
+    const completedNums = Array.from(beatsMap.keys()).sort((a, b) => a - b);
     return {
       completedNums,
       content,
@@ -88,25 +137,16 @@ export async function getCompletedBeatsInChapter(chapterFilePath) {
 export async function getBeatProseFromChapter(chapterFilePath, beatNum) {
   try {
     const content = await fs.readFile(chapterFilePath, 'utf8');
-    const marker = `<!-- BEAT ${beatNum} -->`;
-    const startIdx = content.indexOf(marker);
-    if (startIdx === -1) return '';
-
-    const afterMarker = content.slice(startIdx + marker.length);
-    const nextMarkerMatch = afterMarker.match(/<!-- BEAT \d+ -->/);
-    const rawProse = nextMarkerMatch
-      ? afterMarker.slice(0, nextMarkerMatch.index)
-      : afterMarker;
-
-    return rawProse.replace(/<!-- BEAT \d+ -->/g, '').trim();
+    const { beatsMap } = parseChapterBeats(content);
+    return beatsMap.get(beatNum) || '';
   } catch {
     return '';
   }
 }
 
 /**
- * Extracts all prose from <!-- BEAT 1 --> up to (but not including) <!-- BEAT targetBeatNum -->,
- * strips markers, and returns the last tailWordLimit words for continuity window.
+ * Extracts all prose from beats strictly prior to targetBeatNum in numerical order,
+ * and returns the last tailWordLimit words for continuity window.
  */
 export async function getProseBeforeBeat(chapterFilePath, targetBeatNum, tailWordLimit = 350) {
   if (targetBeatNum <= 1) {
@@ -116,22 +156,15 @@ export async function getProseBeforeBeat(chapterFilePath, targetBeatNum, tailWor
     const content = await fs.readFile(chapterFilePath, 'utf8');
     if (!content.trim()) return '';
 
-    const targetMarker = `<!-- BEAT ${targetBeatNum} -->`;
-    const targetIdx = content.indexOf(targetMarker);
+    const { beatsMap } = parseChapterBeats(content);
+    const priorNums = Array.from(beatsMap.keys())
+      .filter((n) => n < targetBeatNum)
+      .sort((a, b) => a - b);
 
-    const beat1Marker = '<!-- BEAT 1 -->';
-    const beat1Idx = content.indexOf(beat1Marker);
-    const startIdx = beat1Idx !== -1 ? beat1Idx : 0;
+    if (priorNums.length === 0) return '';
 
-    let textBeforeTarget = '';
-    if (targetIdx !== -1) {
-      textBeforeTarget = content.slice(startIdx, targetIdx);
-    } else {
-      textBeforeTarget = content.slice(startIdx);
-    }
-
-    const cleanText = textBeforeTarget.replace(/<!-- BEAT \d+ -->/g, '').trim();
-    return getLastNWords(cleanText, tailWordLimit);
+    const textBeforeTarget = priorNums.map((n) => beatsMap.get(n)).join('\n\n');
+    return getLastNWords(textBeforeTarget, tailWordLimit);
   } catch {
     return '';
   }
@@ -139,8 +172,9 @@ export async function getProseBeforeBeat(chapterFilePath, targetBeatNum, tailWor
 
 /**
  * Safely commits beat prose to chapter.md.
- * Creates a safety backup, replaces only the target beat if already present (for revisions),
- * or appends it cleanly so previous beats are NEVER ruined or overwritten.
+ * Creates a safety backup, updates or inserts the beat in strictly sorted numerical order
+ * (e.g. Beat 1 always precedes Beat 2 even if written out of order),
+ * preserving all existing beats non-destructively.
  */
 export async function commitBeatToChapter({
   chapterFile,
@@ -162,26 +196,11 @@ export async function commitBeatToChapter({
     existing = await fs.readFile(chapterFile, 'utf8');
   } catch {}
 
-  const beatMarker = `<!-- BEAT ${beatNum} -->`;
-  const beatBlock = `${beatMarker}\n${finalProse.trim()}\n`;
+  const { header, beatsMap } = parseChapterBeats(existing);
+  beatsMap.set(beatNum, finalProse.trim());
+  const updated = serializeChapterBeats(header, beatsMap);
 
-  if (!existing || !existing.trim()) {
-    // Fresh chapter file
-    await fs.writeFile(chapterFile, `# Chapter Manuscript\n\n${beatBlock}`, 'utf8');
-    return;
-  }
-
-  // 2. If this beat already exists (e.g. revision or re-write), replace ONLY this beat without affecting earlier or later beats
-  if (existing.includes(beatMarker)) {
-    // Regex matches from <!-- BEAT N --> up to the next <!-- BEAT \d+ --> or EOF
-    const beatSectionRegex = new RegExp(`<!-- BEAT ${beatNum} -->[\\s\\S]*?(?=(?:<!-- BEAT \\d+ -->)|$)`, 'g');
-    const updated = existing.replace(beatSectionRegex, `${beatBlock}\n`);
-    await fs.writeFile(chapterFile, updated.trim() + '\n', 'utf8');
-  } else {
-    // Append while preserving all previous beats completely
-    const updated = existing.trim() + '\n\n' + beatBlock;
-    await fs.writeFile(chapterFile, updated.trim() + '\n', 'utf8');
-  }
+  await fs.writeFile(chapterFile, updated, 'utf8');
 }
 
 /**
@@ -271,27 +290,31 @@ export async function runWriteChapterWorkflow({
   conversationMgr,
   config
 }) {
-  // Parse chapter and optional target beat number:
-  // e.g. "1", "1 2", "1 --beat 2", "1 --beat=2"
+  // Parse chapter, optional target beat number, and optional user edit instruction:
+  // e.g. "1", "1 2", "1 --beat 2", "1 2 Make Jonathan more suspicious", "1 --edit"
   let chapterNum = NaN;
   let targetBeatNum = null;
+  let userInstruction = '';
 
   if (typeof chapterArg === 'number') {
     chapterNum = chapterArg;
   } else if (typeof chapterArg === 'string') {
     const clean = chapterArg.trim();
-    const beatFlagMatch = clean.match(/^(\d+)\s+--beat(?:=|\s+)(\d+)$/i);
-    const twoNumMatch = clean.match(/^(\d+)\s+(\d+)$/);
-    const singleNumMatch = clean.match(/^(\d+)$/);
+    const beatFlagMatch = clean.match(/^(\d+)\s+--beat(?:=|\s+)(\d+)(?:\s+(.*))?$/i);
+    const twoNumMatch = clean.match(/^(\d+)\s+(\d+)(?:\s+(.*))?$/);
+    const singleNumMatch = clean.match(/^(\d+)(?:\s+(.*))?$/);
 
     if (beatFlagMatch) {
       chapterNum = parseInt(beatFlagMatch[1], 10);
       targetBeatNum = parseInt(beatFlagMatch[2], 10);
+      userInstruction = (beatFlagMatch[3] || '').trim();
     } else if (twoNumMatch) {
       chapterNum = parseInt(twoNumMatch[1], 10);
       targetBeatNum = parseInt(twoNumMatch[2], 10);
+      userInstruction = (twoNumMatch[3] || '').trim();
     } else if (singleNumMatch) {
       chapterNum = parseInt(singleNumMatch[1], 10);
+      userInstruction = (singleNumMatch[2] || '').trim();
     }
   }
 
@@ -333,11 +356,14 @@ export async function runWriteChapterWorkflow({
       return;
     }
     beatsToProcess = [matchedBeat];
-    console.log(chalk.bold.cyan(`\n  Targeted Rewrite: Chapter ${chapterNum}, Beat ${targetBeatNum}: "${matchedBeat.title}"`));
+    const existingTargetProse = await getBeatProseFromChapter(chapterFile, targetBeatNum);
+    if (existingTargetProse) {
+      console.log(chalk.bold.cyan(`\n  Targeted Edit/Rewrite: Chapter ${chapterNum}, Beat ${targetBeatNum}: "${matchedBeat.title}"`));
+    } else {
+      console.log(chalk.bold.cyan(`\n  Writing Chapter ${chapterNum}, Beat ${targetBeatNum}: "${matchedBeat.title}"`));
+    }
   } else {
-    // Standard resume flow: determine starting beat
-    console.log(chalk.bold.cyan(`\n  Writing Chapter ${chapterNum} Beat-by-Beat (${beats.length} Beats Total)`));
-
+    // Check completed beats in chapter
     const { completedNums } = await getCompletedBeatsInChapter(chapterFile);
     let currentBeatIndex = 0;
 
@@ -351,19 +377,78 @@ export async function runWriteChapterWorkflow({
       }
     }
 
+    // If all beats in this chapter are already written, enter Chapter Edit Mode!
     if (currentBeatIndex >= beats.length) {
-      console.log(chalk.green(`\nAll ${beats.length} beats for Chapter ${chapterNum} are already written!`));
-      console.log(chalk.dim(`Tip: To rewrite a specific beat, use /write ${chapterNum} <beat_number> (e.g. /write ${chapterNum} 1)`));
-      try {
-        await fs.access(summaryFile);
-        console.log(chalk.dim(`Summary already exists at project/chapter-${padded}/summary.md.`));
-      } catch {
-        await generateChapterSummary({ chapterNum, chapterFile, summaryFile, groqClient, cwd, vectorStore, embedder, config });
-      }
-      return;
-    }
+      console.log(chalk.bold.cyan(`\n  Chapter ${chapterNum} is already written (${beats.length} of ${beats.length} beats present).`));
+      console.log(chalk.bold.yellow(`  Entering Chapter Edit Mode...`));
 
-    beatsToProcess = beats.slice(currentBeatIndex);
+      let editChoice = 'all_beats';
+      if (process.stdin.isTTY) {
+        try {
+          const { select } = await import('@inquirer/prompts');
+          editChoice = await select({
+            message: `Chapter ${chapterNum} is already written. How would you like to edit it?`,
+            choices: [
+              { name: `1. Edit a specific beat (Choose Beat 1–${beats.length})`, value: 'single_beat' },
+              { name: `2. Revise full chapter beat-by-beat (sequential revision with prior drafts)`, value: 'all_beats' },
+              { name: `3. Full chapter manuscript edit (AI editorial pass on full chapter.md)`, value: 'full_manuscript' },
+              { name: `4. Re-generate canonical chapter summary & sync`, value: 'summary_only' },
+              { name: `← Cancel / Return`, value: 'cancel' }
+            ]
+          });
+        } catch {
+          editChoice = 'all_beats';
+        }
+      }
+
+      if (editChoice === 'cancel') {
+        return;
+      }
+      if (editChoice === 'summary_only') {
+        await generateChapterSummary({ chapterNum, chapterFile, summaryFile, groqClient, cwd, vectorStore, embedder, config });
+        return;
+      }
+      if (editChoice === 'single_beat') {
+        let chosenBeatNum = 1;
+        if (process.stdin.isTTY) {
+          try {
+            const { select } = await import('@inquirer/prompts');
+            chosenBeatNum = await select({
+              message: `Select beat in Chapter ${chapterNum} to edit:`,
+              choices: beats.map((b) => ({
+                name: `Beat ${b.num}: ${b.title}`,
+                value: b.num
+              }))
+            });
+          } catch {
+            chosenBeatNum = 1;
+          }
+        }
+        const matched = beats.find((b) => b.num === chosenBeatNum) || beats[0];
+        beatsToProcess = [matched];
+        targetBeatNum = matched.num;
+      } else if (editChoice === 'all_beats') {
+        beatsToProcess = beats;
+      } else if (editChoice === 'full_manuscript') {
+        await runFullChapterEditWorkflow({
+          chapterNum,
+          chapterFile,
+          planContent,
+          summaryFile,
+          groqClient,
+          vectorStore,
+          embedder,
+          reranker,
+          config,
+          cwd,
+          userInstruction
+        });
+        return;
+      }
+    } else {
+      console.log(chalk.bold.cyan(`\n  Writing Chapter ${chapterNum} Beat-by-Beat (${beats.length} Beats Total)`));
+      beatsToProcess = beats.slice(currentBeatIndex);
+    }
   }
 
   const instructions = await loadInstructions(cwd);
@@ -372,15 +457,34 @@ export async function runWriteChapterWorkflow({
   // Process beats
   for (let b = 0; b < beatsToProcess.length; b++) {
     const beat = beatsToProcess[b];
+    const existingBeatProse = await getBeatProseFromChapter(chapterFile, beat.num);
+    const isRevision = Boolean(existingBeatProse && existingBeatProse.trim());
+
     console.log(chalk.bold.magenta(`\n========================================`));
-    console.log(chalk.bold.magenta(`  Writing Beat ${beat.num} of ${beats.length}: ${beat.title}`));
+    if (isRevision) {
+      console.log(chalk.bold.magenta(`  Editing Beat ${beat.num} of ${beats.length}: ${beat.title}`));
+    } else {
+      console.log(chalk.bold.magenta(`  Writing Beat ${beat.num} of ${beats.length}: ${beat.title}`));
+    }
     console.log(chalk.bold.magenta(`========================================`));
     console.log(chalk.dim(`  Characters: ${beat.characters || 'Unspecified'}`));
     console.log(chalk.dim(`  Location:   ${beat.location || 'Unspecified'}`));
     console.log(chalk.dim(`  Action:     ${beat.action || 'Unspecified'}\n`));
 
-    // 1. Targeted Hybrid RAG for this Beat
-    const searchTerms = [beat.characters, beat.location, beat.action].filter(Boolean).join(' ');
+    // If editing existing beat and user did not pass instructions in CLI, ask interactively
+    let beatEditNotes = userInstruction;
+    if (isRevision && !beatEditNotes && process.stdin.isTTY) {
+      try {
+        const { input } = await import('@inquirer/prompts');
+        beatEditNotes = await input({
+          message: `Enter edit/improvement instructions for Beat ${beat.num} (Press Enter for literary polish & depth):`,
+          default: ''
+        });
+      } catch {}
+    }
+
+    // 1. Targeted Hybrid RAG for this Beat (retrieving all necessary files)
+    const searchTerms = [beat.characters, beat.location, beat.action, beat.goalHook, beatEditNotes].filter(Boolean).join(' ');
     let ragChunks = [];
     if (searchTerms.trim()) {
       try {
@@ -407,13 +511,11 @@ export async function runWriteChapterWorkflow({
 
     // 3. Downstream Continuity Context (if rewriting beat B and beat B+1 exists)
     let downstreamContext = '';
-    if (isTargetedBeat) {
-      const nextBeatProse = await getBeatProseFromChapter(chapterFile, beat.num + 1);
-      if (nextBeatProse) {
-        const opening150 = getFirstNWords(nextBeatProse, 150);
-        if (opening150) {
-          downstreamContext = `#### Upcoming Scene Anchor (Beat ${beat.num + 1} Opening - Ensure your ending bridges smoothly into this):\n"${opening150}..."\n`;
-        }
+    const nextBeatProse = await getBeatProseFromChapter(chapterFile, beat.num + 1);
+    if (nextBeatProse) {
+      const opening150 = getFirstNWords(nextBeatProse, 150);
+      if (opening150) {
+        downstreamContext = `#### Upcoming Scene Anchor (Beat ${beat.num + 1} Opening - Ensure your ending bridges smoothly into this):\n"${opening150}..."\n`;
       }
     }
 
@@ -452,6 +554,24 @@ You must strictly embody and adhere to this exact writing style, narrative dista
 
 ${WRITE_BEAT_SYSTEM_PROMPT}`;
 
+    let revisionBlock = '';
+    if (isRevision) {
+      revisionBlock = `
+### PREVIOUS DRAFT OF BEAT ${beat.num} (TO BE REVISED & IMPROVED):
+"""
+${existingBeatProse}
+"""
+
+### REVISION & IMPROVEMENT OBJECTIVE:
+${beatEditNotes || 'Enhance the sensory immersion, dialogue rhythm, emotional depth, and narrative pacing while seamlessly maintaining scene continuity.'}
+
+### EDITING RULES:
+1. You are revising and improving the existing draft of Beat ${beat.num} provided above.
+2. Incorporate the revision objective cleanly while preserving character voices and established canon.
+3. Ensure the scene opens seamlessly from the preceding scene and leads naturally into any upcoming scene.
+4. Output only the continuous, revised narrative prose for Beat ${beat.num}.`;
+    }
+
     let beatProse = '';
     let retryFeedback = '';
     let beatAccepted = false;
@@ -471,9 +591,9 @@ ${downstreamContext ? `\n${downstreamContext}` : ''}
 - **Location:** ${beat.location}
 - **Required Action & Beat Event:** ${beat.action}
 - **Goal / Scene Hook:** ${beat.goalHook}
-${retryFeedback ? `\n### Revision Notes (from previous attempt):\n${retryFeedback}` : ''}
-
-Write the continuous narrative prose for Beat ${beat.num}.`;
+${revisionBlock ? `\n${revisionBlock}` : ''}
+${retryFeedback ? `\n### Revision Notes (from previous attempt):\n${retryFeedback}\n` : ''}
+${isRevision ? `Write the revised and improved narrative prose for Beat ${beat.num}.` : `Write the continuous narrative prose for Beat ${beat.num}.`}`;
 
       process.stdout.write(chalk.bold.green(`\nGenerating Beat ${beat.num} prose:\n\n`));
       beatProse = '';
@@ -635,3 +755,145 @@ export async function generateChapterSummary({
     spinner.fail(`Failed to generate chapter summary: ${err.message}`);
   }
 }
+
+/**
+ * Runs a developmental and line-editorial pass across the full chapter.md manuscript.
+ */
+export async function runFullChapterEditWorkflow({
+  chapterNum,
+  chapterFile,
+  planContent,
+  summaryFile,
+  groqClient,
+  vectorStore,
+  embedder,
+  reranker,
+  config,
+  cwd,
+  userInstruction = ''
+}) {
+  const padded = padChapter(chapterNum);
+  let chapterRaw = '';
+  try {
+    chapterRaw = await fs.readFile(chapterFile, 'utf8');
+  } catch {
+    console.log(chalk.red(`\nNo manuscript found at project/chapter-${padded}/chapter.md.`));
+    return;
+  }
+
+  let editInstructions = userInstruction;
+  if (!editInstructions && process.stdin.isTTY) {
+    try {
+      const { input } = await import('@inquirer/prompts');
+      editInstructions = await input({
+        message: `Enter editorial instructions for Chapter ${chapterNum} (Press Enter for literary polish):`,
+        default: 'Enhance narrative momentum, deepen sensory atmosphere, polish dialogue cadence, and heighten dramatic stakes.'
+      });
+    } catch {}
+  }
+  if (!editInstructions) {
+    editInstructions = 'Enhance narrative momentum, deepen sensory atmosphere, polish dialogue cadence, and heighten dramatic stakes.';
+  }
+
+  console.log(chalk.bold.magenta(`\n========================================`));
+  console.log(chalk.bold.magenta(`  Full Editorial Pass: Chapter ${chapterNum} Manuscript`));
+  console.log(chalk.bold.magenta(`========================================`));
+  console.log(chalk.dim(`  Editorial Direction: ${editInstructions}\n`));
+
+  // RAG for chapter
+  let ragChunks = [];
+  try {
+    const queryVector = await embedder.embedQuery(editInstructions);
+    const candidates = await vectorStore.hybridSearch({
+      queryText: editInstructions,
+      queryVector,
+      vectorTopK: 15,
+      bm25TopK: 15
+    });
+    ragChunks = await reranker.rerank({
+      queryText: editInstructions,
+      candidates,
+      topK: 5
+    });
+  } catch {}
+
+  const tier1 = ragChunks.filter((c) => Number(c.authority_tier) === 1);
+  const instructions = await loadInstructions(cwd);
+  const hierarchyXml = buildHierarchyContext({
+    instructions,
+    tier1Chunks: tier1,
+    tier2Chunks: []
+  });
+
+  const activeStyle = config.enhancedWritingStyle
+    ? `${config.enhancedWritingStyle}\n\nAuthor Core Preferences: ${config.writingStyle}`
+    : (config.writingStyle || '');
+
+  const systemPrompt = `${hierarchyXml}
+
+<chapter_plan>
+${planContent ? planContent.trim() : '(No beat plan)'}
+</chapter_plan>
+
+<writing_style_rules>
+Author's Writing Style:
+${activeStyle || '(Literary novel prose standards)'}
+</writing_style_rules>
+
+You are Quillbot's Senior Developmental & Line Editor.
+Your objective is to revise, polish, and elevate the author's full chapter manuscript according to the author's editorial direction, while adhering to Story Bible canon.
+CRITICAL FORMATTING RULE:
+You MUST preserve all \`<!-- BEAT N -->\` structural comments intact in their correct sequential positions between scenes.`;
+
+  const userPrompt = `### FULL CHAPTER ${chapterNum} MANUSCRIPT TO EDIT:
+${chapterRaw}
+
+### AUTHOR'S EDITORIAL DIRECTION:
+${editInstructions}
+
+Revise and polish Chapter ${chapterNum} according to the editorial direction. Elevate the prose, heighten immersion, and preserve all <!-- BEAT N --> markers.`;
+
+  process.stdout.write(chalk.bold.green(`\nGenerating revised Chapter ${chapterNum} manuscript:\n\n`));
+
+  let revisedChapter = '';
+  try {
+    revisedChapter = await groqClient.streamChatCompletion({
+      model: 'large',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ],
+      temperature: config.generation?.temperatureWrite || 0.7,
+      onChunk: (delta) => {
+        process.stdout.write(delta);
+      }
+    });
+    console.log('\n');
+  } catch (err) {
+    console.error(chalk.red(`\nChapter revision failed: ${err.message}`));
+    return;
+  }
+
+  const review = await promptReviewWorkflow({
+    draftContent: revisedChapter,
+    itemLabel: `Chapter ${chapterNum} Manuscript`,
+    allowPause: false,
+    preferredEditor: config.editor
+  });
+
+  if (review.action === 'accept') {
+    await createBackup(chapterFile, cwd);
+    // Parse beats to ensure ordering is guaranteed
+    const { header, beatsMap } = parseChapterBeats(review.content);
+    if (beatsMap.size > 0) {
+      await fs.writeFile(chapterFile, serializeChapterBeats(header, beatsMap), 'utf8');
+    } else {
+      await fs.writeFile(chapterFile, review.content.trim() + '\n', 'utf8');
+    }
+    console.log(chalk.green(`\nChapter ${chapterNum} updated in project/chapter-${padded}/chapter.md`));
+    await generateChapterSummary({ chapterNum, chapterFile, summaryFile, groqClient, cwd, vectorStore, embedder, config });
+  } else {
+    console.log(chalk.yellow(`\nChapter ${chapterNum} revision discarded. Original manuscript kept intact.`));
+  }
+}
+

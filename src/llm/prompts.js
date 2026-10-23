@@ -112,6 +112,18 @@ EXACT OUTPUT SCHEMA:
 
 (Include between 3 to 6 beats per chapter depending on chapter scope. Ensure all Action and Goal/Hook entries are thorough paragraphs, never tables or terse fragments.)`;
 
+export const PLAN_SINGLE_BEAT_SYSTEM_PROMPT = `You are a master story architect. Your task is to plan or edit a specific beat for a chapter in the novel.
+You must adhere strictly to the Hierarchy of Truth, the global instructions, the Story Bible canon, preceding chapter summaries, and surrounding chapter beats.
+
+CRITICAL FORMATTING & STRUCTURE RULES (NO TABLES):
+- The beat must be formatted strictly as:
+### Beat [N]: [Short Beat Title]
+- **Characters:** [Comma-separated character names matching Story Bible]
+- **Location:** [Location name matching Story Bible]
+- **Action:** [A rich narrative paragraph describing in full detail what happens in this beat, character interactions, sensory events, and internal/external tension.]
+- **Goal/Hook:** [A narrative paragraph describing how this beat resolves its immediate beat goal, leaves unresolved tension, and transitions smoothly into the next beat.]
+- Output ONLY the single beat block starting with "### Beat [N]:". Do not include extra headings, document summaries, or conversational preamble.`;
+
 export const WRITE_BEAT_SYSTEM_PROMPT = `You are an acclaimed novelist writing prose for a novel chapter.
 You are writing ONE BEAT at a time.
 

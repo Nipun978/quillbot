@@ -1,3 +1,5 @@
+import { ensureOllamaRunning, pullOllamaModel } from './ollamaManager.js';
+
 export class OllamaEmbedder {
   constructor(config = {}) {
     this.baseUrl = (config.ollama?.baseUrl || 'http://127.0.0.1:11434').replace(/\/$/, '');
@@ -12,7 +14,17 @@ export class OllamaEmbedder {
     this.dimensions = config.ollama?.embeddingDimensions || this.dimensions;
   }
 
-  async checkConnection() {
+  async checkConnection({ autoStart = true } = {}) {
+    if (autoStart) {
+      const ensureRes = await ensureOllamaRunning({ baseUrl: this.baseUrl, model: this.model });
+      if (!ensureRes.ok) {
+        return {
+          ok: false,
+          error: ensureRes.error || `Could not connect to Ollama at ${this.baseUrl}.`
+        };
+      }
+    }
+
     try {
       const tagsRes = await fetch(`${this.baseUrl}/api/tags`, {
         method: 'GET',
@@ -25,11 +37,28 @@ export class OllamaEmbedder {
           error: `Ollama responded with HTTP ${tagsRes.status} at ${this.baseUrl}`
         };
       }
-      const data = await tagsRes.json();
-      const models = (data.models || []).map((m) => m.name);
-      const hasModel = models.some(
+      let data = await tagsRes.json();
+      let models = (data.models || []).map((m) => m.name);
+      let hasModel = models.some(
         (name) => name === this.model || name.startsWith(`${this.model}:`)
       );
+
+      if (!hasModel && autoStart) {
+        // Automatically attempt to pull the model if missing
+        await pullOllamaModel(this.baseUrl, this.model);
+        const retryTags = await fetch(`${this.baseUrl}/api/tags`, {
+          method: 'GET',
+          headers: { 'Content-Type': 'application/json' },
+          signal: AbortSignal.timeout(5000)
+        });
+        if (retryTags.ok) {
+          data = await retryTags.json();
+          models = (data.models || []).map((m) => m.name);
+          hasModel = models.some(
+            (name) => name === this.model || name.startsWith(`${this.model}:`)
+          );
+        }
+      }
 
       if (!hasModel) {
         return {

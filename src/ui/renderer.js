@@ -43,9 +43,9 @@ export function printHelp() {
   const commands = [
     ['/init', 'Seed Story Bible from a "Story in a Nutshell" synopsis'],
     ['/bible [subcommand]', 'Consult lore, or /bible create, /bible edit, /bible list, /bible save'],
-    ['/plan <chapter>', 'Generate structured beat plan for chapter (e.g. /plan 1)'],
-    ['/write <chapter>', 'Write chapter beat-by-beat with Accept / Retry / Edit'],
-    ['/export [txt]', 'Compile all chapters into clean manuscript in exports/'],
+    ['/plan <ch> [beat]', 'Plan or edit chapter beats (e.g. /plan 1 or /plan 1 2)'],
+    ['/write <ch> [beat]', 'Write or edit chapter/beat (e.g. /write 1 or /write 1 2)'],
+    ['/export [scope]', 'Export chapter, range (e.g. /export 1-3), or full manuscript'],
     ['/chat [message]', 'Open conversational chat with Story Bible & project RAG'],
     ['/archive', 'Archive active conversation and empty current.json'],
     ['/load', 'Restore an archived conversation session'],

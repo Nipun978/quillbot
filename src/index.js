@@ -31,9 +31,9 @@ export async function main() {
     config = await loadConfig(cwd);
   }
 
-  // 2. Initialize Ollama Embedder & Verify Connection
+  // 2. Initialize Ollama Embedder & Verify Connection (Auto-start Ollama if offline)
   const embedder = new OllamaEmbedder(config);
-  const ollamaCheck = await embedder.checkConnection();
+  const ollamaCheck = await embedder.checkConnection({ autoStart: true });
   if (!ollamaCheck.ok) {
     console.log(chalk.yellow(`\n[Ollama Warning] ${ollamaCheck.error}`));
     console.log(chalk.dim(`Make sure Ollama is running and run: ollama pull ${config.ollama?.embeddingModel || 'embeddinggemma'}\n`));

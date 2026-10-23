@@ -47,9 +47,9 @@ export async function showSlashCommandMenu() {
   const choices = [
     { name: `${chalk.bold.cyan('/init')}     ${chalk.dim('—')} Seed Story Bible from a synopsis`, value: '/init' },
     { name: `${chalk.bold.cyan('/bible')}    ${chalk.dim('—')} Consult Story Bible lore or /bible save`, value: '/bible' },
-    { name: `${chalk.bold.cyan('/plan')}     ${chalk.dim('—')} Plan chapter into structured beats`, value: '/plan' },
-    { name: `${chalk.bold.cyan('/write')}    ${chalk.dim('—')} Write chapter beat-by-beat`, value: '/write' },
-    { name: `${chalk.bold.cyan('/export')}   ${chalk.dim('—')} Compile all chapters into clean manuscript`, value: '/export' },
+    { name: `${chalk.bold.cyan('/plan')}     ${chalk.dim('—')} Plan or edit chapter beats (e.g. /plan 1 or /plan 1 2)`, value: '/plan' },
+    { name: `${chalk.bold.cyan('/write')}    ${chalk.dim('—')} Write or edit chapter beat-by-beat`, value: '/write' },
+    { name: `${chalk.bold.cyan('/export')}   ${chalk.dim('—')} Export chapter, range (e.g. 1-3), or manuscript`, value: '/export' },
     { name: `${chalk.bold.cyan('/chat')}     ${chalk.dim('—')} Conversational chat with Story Bible RAG`, value: '/chat' },
     { name: `${chalk.bold.cyan('/archive')}  ${chalk.dim('—')} Archive active conversation & empty current.json`, value: '/archive' },
     { name: `${chalk.bold.cyan('/load')}     ${chalk.dim('—')} Restore an archived conversation session`, value: '/load' },
@@ -88,6 +88,13 @@ export async function resolveCommandArguments(selected, cwd) {
       message: 'Enter chapter number to plan:',
       default: String(state.activeChapter || 1)
     });
+    const beat = await promptInput({
+      message: 'Target Beat number (press Enter to plan/edit whole chapter, or enter beat number e.g. 1, 2, or "add"):',
+      default: ''
+    });
+    if (beat && beat.trim()) {
+      return `/plan ${ch.trim()} ${beat.trim()}`;
+    }
     return `/plan ${ch.trim()}`;
   } else if (selected === '/write') {
     const state = await loadState(cwd);
@@ -96,7 +103,7 @@ export async function resolveCommandArguments(selected, cwd) {
       default: String(state.activeChapter || 1)
     });
     const beat = await promptInput({
-      message: 'Target Beat number (press Enter to auto-resume from next unwritten beat):',
+      message: 'Target Beat number (press Enter to auto-resume or enter edit mode if complete):',
       default: ''
     });
     if (beat && beat.trim()) {
@@ -104,6 +111,13 @@ export async function resolveCommandArguments(selected, cwd) {
     }
     return `/write ${ch.trim()}`;
   } else if (selected === '/export') {
+    const scope = await promptInput({
+      message: 'Enter chapter number or range to export (e.g. 1, 1-3, or press Enter for all):',
+      default: ''
+    });
+    if (scope && scope.trim()) {
+      return `/export ${scope.trim()}`;
+    }
     return '/export';
   } else if (selected === '/bible') {
     // Show the Story Bible menu directly with Query visible
