@@ -14,6 +14,7 @@ import { padChapter } from './planChapter.js';
 import { createSpinner } from '../ui/renderer.js';
 import { promptReviewWorkflow } from '../ui/reviewPrompt.js';
 import { syncAllFiles } from '../rag/fileSync.js';
+import { ensureStdinRaw } from '../ui/ttyManager.js';
 
 export function parseBeatsFromPlan(planContent) {
   const beatRegex = /^### Beat (\d+): (.*?)$/gm;
@@ -319,6 +320,7 @@ export async function runWriteChapterWorkflow({
   }
 
   if (isNaN(chapterNum) || chapterNum < 1) {
+    ensureStdinRaw();
     if (process.stdin.isTTY) {
       try {
         const { input } = await import('@inquirer/prompts');
@@ -397,6 +399,7 @@ export async function runWriteChapterWorkflow({
       console.log(chalk.bold.yellow(`  Entering Chapter Edit Mode...`));
 
       let editChoice = 'all_beats';
+      ensureStdinRaw();
       if (process.stdin.isTTY) {
         try {
           const { select } = await import('@inquirer/prompts');
@@ -424,6 +427,7 @@ export async function runWriteChapterWorkflow({
       }
       if (editChoice === 'single_beat') {
         let chosenBeatNum = 1;
+        ensureStdinRaw();
         if (process.stdin.isTTY) {
           try {
             const { select } = await import('@inquirer/prompts');
@@ -487,6 +491,7 @@ export async function runWriteChapterWorkflow({
 
     // If editing existing beat and user did not pass instructions in CLI, ask interactively
     let beatEditNotes = userInstruction;
+    ensureStdinRaw();
     if (isRevision && !beatEditNotes && process.stdin.isTTY) {
       try {
         const { input } = await import('@inquirer/prompts');
@@ -796,6 +801,7 @@ export async function runFullChapterEditWorkflow({
   }
 
   let editInstructions = userInstruction;
+  ensureStdinRaw();
   if (!editInstructions && process.stdin.isTTY) {
     try {
       const { input } = await import('@inquirer/prompts');

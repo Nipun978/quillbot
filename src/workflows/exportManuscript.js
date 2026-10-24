@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import chalk from 'chalk';
+import { ensureStdinRaw } from '../ui/ttyManager.js';
 
 /**
  * Extracts chapter title from plan.md content or falls back to 'Chapter N'
@@ -144,6 +145,7 @@ export async function runExportWorkflow({
   let currentArg = arg;
 
   // If no arguments provided at all and running in interactive terminal, prompt for chapter or range
+  ensureStdinRaw();
   if (currentArg === undefined && process.stdin.isTTY) {
     try {
       const { input } = await import('@inquirer/prompts');

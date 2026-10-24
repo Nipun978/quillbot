@@ -14,6 +14,7 @@ import { parseBeatsFromPlan } from './writeChapter.js';
 import { createSpinner, printMarkdown } from '../ui/renderer.js';
 import { promptReviewWorkflow } from '../ui/reviewPrompt.js';
 import { syncAllFiles } from '../rag/fileSync.js';
+import { ensureStdinRaw } from '../ui/ttyManager.js';
 
 export function padChapter(num) {
   return String(num).padStart(2, '0');
@@ -124,6 +125,7 @@ export async function runEditSingleBeatPlanWorkflow({
   }
 
   let guidance = userGuidance;
+  ensureStdinRaw();
   if (!guidance && process.stdin.isTTY) {
     try {
       guidance = await input({
@@ -321,6 +323,7 @@ export async function runPlanChapterWorkflow({
   }
 
   if (isNaN(chapterNum) || chapterNum < 1) {
+    ensureStdinRaw();
     if (process.stdin.isTTY) {
       try {
         const state = await loadState(cwd);
@@ -379,6 +382,7 @@ export async function runPlanChapterWorkflow({
     console.log(chalk.bold.yellow(`  Entering Chapter Plan Edit Mode...`));
 
     let planAction = 'edit_full_plan';
+    ensureStdinRaw();
     if (process.stdin.isTTY) {
       try {
         planAction = await select({
@@ -401,6 +405,7 @@ export async function runPlanChapterWorkflow({
     }
     if (planAction === 'edit_beat') {
       let chosenBeat = 1;
+      ensureStdinRaw();
       if (process.stdin.isTTY) {
         try {
           chosenBeat = await select({
@@ -464,6 +469,7 @@ export async function runPlanChapterWorkflow({
   );
 
   let guidance = userGuidance;
+  ensureStdinRaw();
   if (!guidance && process.stdin.isTTY) {
     try {
       guidance = await input({

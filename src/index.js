@@ -17,8 +17,10 @@ import { ConversationManager } from './workflows/conversationMgr.js';
 import { runInitProjectWorkflow } from './workflows/initProject.js';
 import { startRepl } from './ui/repl.js';
 import { createSpinner } from './ui/renderer.js';
+import { enableStdinProtection } from './ui/ttyManager.js';
 
 export async function main() {
+  enableStdinProtection();
   const cwd = process.cwd();
 
   // 1. Check or Run Onboarding Wizard

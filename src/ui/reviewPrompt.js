@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { createPrompt, useState, useKeypress, usePrefix, isEnterKey, isUpKey, isDownKey } from '@inquirer/core';
 import { input } from '@inquirer/prompts';
 import chalk from 'chalk';
+import { ensureStdinRaw, suspendStdinProtection } from './ttyManager.js';
 
 export const hotkeySelect = createPrompt((config, done) => {
   const { message, choices = [] } = config;
@@ -62,16 +63,18 @@ export async function openInEditor(initialContent = '', preferredEditor = '') {
 
   // Determine shell option on Windows if editor is a command
   const isWin = process.platform === 'win32';
-  const spawnRes = spawnSync(editor, [tempFile], {
-    stdio: 'inherit',
-    shell: isWin
-  });
-
-  if (process.stdin.isTTY) {
-    try {
-      process.stdin.resume();
-    } catch {}
+  const resumeProtection = suspendStdinProtection();
+  let spawnRes;
+  try {
+    spawnRes = spawnSync(editor, [tempFile], {
+      stdio: 'inherit',
+      shell: isWin
+    });
+  } finally {
+    resumeProtection();
   }
+
+  ensureStdinRaw();
 
   if (spawnRes.error) {
     console.error(chalk.red(`Failed to launch editor "${editor}": ${spawnRes.error.message}`));
@@ -98,6 +101,7 @@ export async function promptReviewWorkflow({
   preferredEditor = '',
   criticIssues = []
 }) {
+  ensureStdinRaw();
   const choices = [
     { key: 'a', name: '[A]ccept - Commit and proceed', value: 'accept' },
     { key: 'r', name: '[R]etry  - Regenerate with revision feedback', value: 'retry' },

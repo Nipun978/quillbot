@@ -14,6 +14,7 @@ import { createBackup } from '../config/backupManager.js';
 import { createSpinner, printMarkdown } from '../ui/renderer.js';
 import { promptReviewWorkflow, openInEditor } from '../ui/reviewPrompt.js';
 import { syncAllFiles } from '../rag/fileSync.js';
+import { ensureStdinRaw } from '../ui/ttyManager.js';
 
 export async function runBibleQuery({
   query,
@@ -29,9 +30,7 @@ export async function runBibleQuery({
 
   // If /bible is called without arguments, show an interactive submenu
   if (!trimmed) {
-    if (process.stdin.isTTY) {
-      try { process.stdin.resume(); } catch {}
-    }
+    ensureStdinRaw();
 
     const action = await select({
       message: 'Story Bible Actions:',
@@ -60,9 +59,7 @@ export async function runBibleQuery({
     }
 
     // Otherwise query / consult
-    if (process.stdin.isTTY) {
-      try { process.stdin.resume(); } catch {}
-    }
+    ensureStdinRaw();
     const q = await input({
       message: 'Enter your lore query or question:'
     });

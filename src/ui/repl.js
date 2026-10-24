@@ -11,6 +11,7 @@ import { runWriteChapterWorkflow } from '../workflows/writeChapter.js';
 import { runExportWorkflow } from '../workflows/exportManuscript.js';
 import { syncAllFiles, getTrackedFiles } from '../rag/fileSync.js';
 import { runOnboardingWizard } from '../config/configManager.js';
+import { enableStdinProtection, ensureStdinRaw } from './ttyManager.js';
 
 export const SLASH_COMMANDS = [
   '/init',
@@ -38,11 +39,7 @@ export function completer(line) {
 }
 
 export async function showSlashCommandMenu() {
-  if (process.stdin.isTTY) {
-    try {
-      process.stdin.resume();
-    } catch {}
-  }
+  ensureStdinRaw();
 
   const choices = [
     { name: `${chalk.bold.cyan('/write')}    ${chalk.dim('—')} Write or edit chapter beat-by-beat`, value: '/write' },
@@ -76,11 +73,7 @@ export async function showSlashCommandMenu() {
 }
 
 export async function resolveCommandArguments(selected, cwd) {
-  if (process.stdin.isTTY) {
-    try {
-      process.stdin.resume();
-    } catch {}
-  }
+  ensureStdinRaw();
 
   if (selected === '/plan') {
     const state = await loadState(cwd);
@@ -219,11 +212,7 @@ export async function readReplInput(promptText) {
     });
   }
 
-  if (process.stdin.isTTY) {
-    try {
-      process.stdin.resume();
-    } catch {}
-  }
+  ensureStdinRaw();
 
   try {
     return await replInputPrompt({});
@@ -247,6 +236,7 @@ export async function startRepl({
   config,
   watcher
 }) {
+  enableStdinProtection();
   printBanner();
   console.log(chalk.dim('Press ') + chalk.bold.cyan('/') + chalk.dim(' anytime to open the command dropdown menu, or type freely to consult lore / chat.\n'));
 
@@ -254,11 +244,7 @@ export async function startRepl({
 
   while (running) {
     try {
-      if (process.stdin.isTTY) {
-        try {
-          process.stdin.resume();
-        } catch {}
-      }
+      ensureStdinRaw();
 
       const promptText = chalk.bold.hex('#7C3AED')('quillbot') + chalk.dim(' > ');
       const readResult = await readReplInput(promptText);
