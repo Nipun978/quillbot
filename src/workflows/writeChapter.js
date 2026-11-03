@@ -614,6 +614,14 @@ ${revisionBlock ? `\n${revisionBlock}` : ''}
 ${retryFeedback ? `\n### Revision Notes (from previous attempt):\n${retryFeedback}\n` : ''}
 ${isRevision ? `Write the revised and improved narrative prose for Beat ${beat.num}.` : `Write the continuous narrative prose for Beat ${beat.num}.`}`;
 
+      if (groqClient?.quotaManager) {
+        const cd = config?.cooldownSeconds !== undefined ? config.cooldownSeconds : (process.stdin?.isTTY ? 45 : 0);
+        await groqClient.quotaManager.enforceGenerationCooldown({
+          cooldownSeconds: cd,
+          isPaid: config?.apiTier === 'paid' || config?.apiTier === 'developer'
+        });
+      }
+
       process.stdout.write(chalk.bold.green(`\nGenerating Beat ${beat.num} prose:\n\n`));
       beatProse = '';
 
@@ -630,6 +638,9 @@ ${isRevision ? `Write the revised and improved narrative prose for Beat ${beat.n
           }
         });
         console.log('\n');
+        if (groqClient?.quotaManager) {
+          groqClient.quotaManager.recordGenerationEnd();
+        }
       } catch (err) {
         console.error(chalk.red(`\nBeat generation failed: ${err.message}`));
         return;
@@ -679,7 +690,11 @@ ${isRevision ? `Write the revised and improved narrative prose for Beat ${beat.n
         itemLabel: `Beat ${beat.num} Prose`,
         allowPause: true,
         preferredEditor: config.editor,
-        criticIssues: criticResult.issues || []
+
+        criticIssues: criticResult.issues || [],
+        quotaManager: groqClient?.quotaManager,
+        config,
+        model: config.models?.large || 'openai/gpt-oss-120b'
       });
 
       if (review.action === 'accept') {
@@ -873,6 +888,14 @@ ${editInstructions}
 
 Revise and polish Chapter ${chapterNum} according to the editorial direction. Elevate the prose, heighten immersion, and preserve all <!-- BEAT N --> markers.`;
 
+  if (groqClient?.quotaManager) {
+    const cd = config?.cooldownSeconds !== undefined ? config.cooldownSeconds : (process.stdin?.isTTY ? 45 : 0);
+    await groqClient.quotaManager.enforceGenerationCooldown({
+      cooldownSeconds: cd,
+      isPaid: config?.apiTier === 'paid' || config?.apiTier === 'developer'
+    });
+  }
+
   process.stdout.write(chalk.bold.green(`\nGenerating revised Chapter ${chapterNum} manuscript:\n\n`));
 
   let revisedChapter = '';
@@ -889,6 +912,10 @@ Revise and polish Chapter ${chapterNum} according to the editorial direction. El
       }
     });
     console.log('\n');
+    if (groqClient?.quotaManager) {
+      groqClient.quotaManager.recordGenerationEnd();
+    }
+
   } catch (err) {
     console.error(chalk.red(`\nChapter revision failed: ${err.message}`));
     return;
@@ -898,7 +925,10 @@ Revise and polish Chapter ${chapterNum} according to the editorial direction. El
     draftContent: revisedChapter,
     itemLabel: `Chapter ${chapterNum} Manuscript`,
     allowPause: false,
-    preferredEditor: config.editor
+    preferredEditor: config.editor,
+    quotaManager: groqClient?.quotaManager,
+    config,
+    model: config.models?.large || 'openai/gpt-oss-120b'
   });
 
   if (review.action === 'accept') {

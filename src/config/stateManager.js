@@ -17,6 +17,10 @@ export async function hasState(cwd = process.cwd()) {
   }
 }
 
+export function getTodayDateString() {
+  return new Date().toISOString().slice(0, 10);
+}
+
 export function getDefaultState() {
   const now = new Date();
   const timestamp = now.toISOString().replace(/[-:T]/g, '').slice(0, 14);
@@ -25,7 +29,8 @@ export function getDefaultState() {
     activeChapter: 1,
     activeBeat: 1,
     activeConversationId: `conv_${timestamp}`,
-    fileHashes: {}
+    fileHashes: {},
+    dailyUsage: {}
   };
 }
 
@@ -37,7 +42,8 @@ export async function loadState(cwd = process.cwd()) {
     return {
       ...getDefaultState(),
       ...parsed,
-      fileHashes: parsed.fileHashes || {}
+      fileHashes: parsed.fileHashes || {},
+      dailyUsage: parsed.dailyUsage || {}
     };
   } catch {
     return getDefaultState();
@@ -72,4 +78,32 @@ export async function setActiveBeat(chapter, beat, cwd = process.cwd()) {
   state.activeBeat = Number(beat);
   await saveState(state, cwd);
   return state;
+}
+
+export async function recordDailyTokens(model, tokens = 0, cwd = process.cwd()) {
+  const state = await loadState(cwd);
+  const today = getTodayDateString();
+  if (!state.dailyUsage || typeof state.dailyUsage !== 'object') {
+    state.dailyUsage = {};
+  }
+  // Automatically reset old dates on date change
+  if (!state.dailyUsage[today]) {
+    state.dailyUsage = { [today]: {} };
+  }
+  if (!state.dailyUsage[today][model]) {
+    state.dailyUsage[today][model] = { tokens: 0, requests: 0 };
+  }
+  state.dailyUsage[today][model].tokens += (Number(tokens) || 0);
+  state.dailyUsage[today][model].requests += 1;
+  await saveState(state, cwd);
+  return state.dailyUsage[today][model];
+}
+
+export async function getDailyTokens(model, cwd = process.cwd()) {
+  const state = await loadState(cwd);
+  const today = getTodayDateString();
+  if (!state.dailyUsage || !state.dailyUsage[today] || !state.dailyUsage[today][model]) {
+    return { tokens: 0, requests: 0 };
+  }
+  return state.dailyUsage[today][model];
 }

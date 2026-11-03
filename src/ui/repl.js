@@ -2,7 +2,7 @@ import readline from 'node:readline/promises';
 import { select, input as promptInput } from '@inquirer/prompts';
 import { createPrompt, useState, useKeypress, isEnterKey } from '@inquirer/core';
 import chalk from 'chalk';
-import { printHelp, printBanner, createSpinner } from './renderer.js';
+import { printHelp, printBanner, createSpinner, renderQuotaDashboard } from './renderer.js';
 import { loadState } from '../config/stateManager.js';
 import { runInitProjectWorkflow } from '../workflows/initProject.js';
 import { runBibleQuery } from '../workflows/chatBible.js';
@@ -303,6 +303,10 @@ export async function startRepl({
         console.log(`  Ollama Model:       ${chalk.green(config.ollama?.embeddingModel)}`);
         console.log(`  Groq Model (Small): ${chalk.green(config.models?.small)}`);
         console.log(`  Groq Model (Large): ${chalk.green(config.models?.large)}\n`);
+        if (groqClient?.quotaManager) {
+          const dashboardData = await groqClient.quotaManager.getDashboardData(cwd);
+          renderQuotaDashboard(dashboardData);
+        }
         continue;
       }
 

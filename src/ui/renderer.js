@@ -71,3 +71,28 @@ export function createSpinner(text) {
     spinner: 'dots'
   });
 }
+
+export function renderQuotaDashboard(dashboardData) {
+  if (!dashboardData || !dashboardData.models || dashboardData.models.length === 0) {
+    return;
+  }
+
+  console.log(chalk.bold.cyan('  Groq Quotas & Rate Limits Dashboard:'));
+  const tierName = dashboardData.isPaid ? 'Developer Plan (Pay-As-You-Go)' : 'Free Plan';
+  console.log(`  Account Tier:       ${chalk.green(tierName)}\n`);
+
+  for (const m of dashboardData.models) {
+    console.log(chalk.bold.magenta(`  Model: ${m.model} (${m.label})`));
+    const tpmReset = m.resetTokens ? ` (resets in ${m.resetTokens})` : '';
+    const rpdReset = m.resetRequests ? ` (resets in ${m.resetRequests})` : '';
+    const tpdLimit = m.limitTpd === Infinity ? 'Pay-As-You-Go' : m.limitTpd.toLocaleString();
+    const tpdRem = m.remainingTpd === Infinity ? 'Uncapped' : m.remainingTpd.toLocaleString();
+    const rpdLimit = m.limitRpd === Infinity ? 'Uncapped' : m.limitRpd.toLocaleString();
+    const rpdRem = m.remainingRpd === Infinity ? 'Uncapped' : m.remainingRpd.toLocaleString();
+
+    console.log(`    TPM (Tokens / Min):   [${m.usedTpm.toLocaleString()} / ${m.limitTpm.toLocaleString()}] | Remaining: ${chalk.green(m.remainingTpm.toLocaleString())}${tpmReset}`);
+    console.log(`    TPD (Tokens / Day):   [${m.usedTpd.toLocaleString()} / ${tpdLimit}] | Remaining: ${chalk.green(tpdRem)}`);
+    console.log(`    RPM (Requests / Min): [${m.usedRpm.toLocaleString()} / ${m.limitRpm.toLocaleString()}] | Remaining: ${chalk.green(m.remainingRpm.toLocaleString())}`);
+    console.log(`    RPD (Requests / Day): [${m.usedRpd.toLocaleString()} / ${rpdLimit}] | Remaining: ${chalk.green(rpdRem)}${rpdReset}\n`);
+  }
+}

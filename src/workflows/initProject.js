@@ -120,7 +120,10 @@ ${bibleData.plotOverview || '(Empty)'}
       draftContent: preview,
       itemLabel: 'Story Bible draft',
       allowPause: false,
-      preferredEditor: config.editor
+      preferredEditor: config.editor,
+      quotaManager: groqClient?.quotaManager,
+      config,
+      model: config.models?.large || 'openai/gpt-oss-120b'
     });
 
     if (review.action === 'accept') {

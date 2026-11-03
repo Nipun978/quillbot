@@ -1,0 +1,15 @@
+{
+  "initialized": true,
+  "activeChapter": 1,
+  "activeBeat": 1,
+  "activeConversationId": "conv_20261103064907",
+  "fileHashes": {},
+  "dailyUsage": {
+    "2026-11-03": {
+      "openai/gpt-oss-120b": {
+        "tokens": 600,
+        "requests": 4
+      }
+    }
+  }
+}

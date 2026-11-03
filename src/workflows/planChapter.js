@@ -229,6 +229,14 @@ Generate the beat block for Beat ${targetNum} matching:
 - **Action:** [Paragraph describing the beat events]
 - **Goal/Hook:** [Paragraph describing resolution and hook]`;
 
+      if (groqClient?.quotaManager) {
+        const cd = config?.cooldownSeconds !== undefined ? config.cooldownSeconds : (process.stdin?.isTTY ? 45 : 0);
+        await groqClient.quotaManager.enforceGenerationCooldown({
+          cooldownSeconds: cd,
+          isPaid: config?.apiTier === 'paid' || config?.apiTier === 'developer'
+        });
+      }
+
       finalBeatPlan = await groqClient.chatCompletion({
         model: 'large',
         messages: [
@@ -239,6 +247,9 @@ Generate the beat block for Beat ${targetNum} matching:
       });
 
       beatSpinner.succeed(`Generated Beat ${targetNum} plan.`);
+      if (groqClient?.quotaManager) {
+        groqClient.quotaManager.recordGenerationEnd();
+      }
     } catch (err) {
       beatSpinner.fail(`Failed to generate beat plan: ${err.message}`);
       return;
@@ -251,7 +262,10 @@ Generate the beat block for Beat ${targetNum} matching:
       draftContent: finalBeatPlan,
       itemLabel: `Chapter ${chapterNum} Beat ${targetNum} Plan`,
       allowPause: false,
-      preferredEditor: config.editor
+      preferredEditor: config.editor,
+      quotaManager: groqClient?.quotaManager,
+      config,
+      model: config.models?.large || 'openai/gpt-oss-120b'
     });
 
     if (review.action === 'accept') {
@@ -578,6 +592,14 @@ ${currentFeedback ? `\nRevision Feedback:\n${currentFeedback}` : ''}
 Generate the complete Chapter ${chapterNum} plan using the strict Beat schema.`;
       }
 
+      if (groqClient?.quotaManager) {
+        const cd = config?.cooldownSeconds !== undefined ? config.cooldownSeconds : (process.stdin?.isTTY ? 45 : 0);
+        await groqClient.quotaManager.enforceGenerationCooldown({
+          cooldownSeconds: cd,
+          isPaid: config?.apiTier === 'paid' || config?.apiTier === 'developer'
+        });
+      }
+
       finalPlan = await groqClient.chatCompletion({
         model: 'large',
         messages: [
@@ -592,6 +614,11 @@ Generate the complete Chapter ${chapterNum} plan using the strict Beat schema.`;
           ? `Revised Chapter ${chapterNum} plan.`
           : `Generated Chapter ${chapterNum} plan.`
       );
+
+      if (groqClient?.quotaManager) {
+        groqClient.quotaManager.recordGenerationEnd();
+      }
+
     } catch (err) {
       planSpinner.fail(`Failed to generate plan: ${err.message}`);
       return;
@@ -611,7 +638,10 @@ Generate the complete Chapter ${chapterNum} plan using the strict Beat schema.`;
       draftContent: finalPlan,
       itemLabel: `Chapter ${chapterNum} Plan`,
       allowPause: false,
-      preferredEditor: config.editor
+      preferredEditor: config.editor,
+      quotaManager: groqClient?.quotaManager,
+      config,
+      model: config.models?.large || 'openai/gpt-oss-120b'
     });
 
     if (review.action === 'accept') {

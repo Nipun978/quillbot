@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { input, password } from '@inquirer/prompts';
 import chalk from 'chalk';
 import { hasState, saveState, getDefaultState } from './stateManager.js';
+import { probeApiKey } from '../llm/quotaManager.js';
 
 dotenv.config();
 
@@ -78,6 +79,9 @@ export function getDefaultConfig() {
     writingStyle: 'Third-person limited, atmospheric, psychologically nuanced, sensory-rich prose',
     enhancedWritingStyle: '',
     groqApiKey: process.env.GROQ_API_KEY || '',
+    apiTier: 'free',
+    cooldownSeconds: 45,
+    rateLimits: {},
     models: {
       small: 'openai/gpt-oss-20b',
       large: 'openai/gpt-oss-120b'
@@ -119,6 +123,9 @@ export async function loadConfig(cwd = process.cwd()) {
       projectTitle: parsed.projectTitle || defaults.projectTitle,
       writingStyle: parsed.writingStyle || defaults.writingStyle,
       enhancedWritingStyle: parsed.enhancedWritingStyle || '',
+      apiTier: parsed.apiTier || defaults.apiTier,
+      cooldownSeconds: parsed.cooldownSeconds !== undefined ? parsed.cooldownSeconds : defaults.cooldownSeconds,
+      rateLimits: parsed.rateLimits || defaults.rateLimits,
       models: { ...defaults.models, ...(parsed.models || {}) },
       ollama: { ...defaults.ollama, ...(parsed.ollama || {}) },
       rag: { ...defaults.rag, ...(parsed.rag || {}) },
@@ -242,13 +249,49 @@ export async function runOnboardingWizard(cwd = process.cwd()) {
   const defaults = getDefaultConfig();
   const envKey = process.env.GROQ_API_KEY || '';
 
-  // 1. Pipeline configuration details FIRST
-  const groqApiKey = await password({
-    message: 'Enter your Groq API Key' + (envKey ? ' (press Enter to use GROQ_API_KEY from environment)' : '') + ':',
-    mask: '*'
-  });
+  // 1. Pipeline configuration details FIRST with immediate probe validation loop
+  let validKey = false;
+  let finalGroqKey = '';
+  let probeInfo = null;
 
-  const finalGroqKey = (groqApiKey && groqApiKey.trim()) || envKey;
+  while (!validKey) {
+    const groqApiKey = await password({
+      message: 'Enter your Groq API Key' + (envKey ? ' (press Enter to use GROQ_API_KEY from environment)' : '') + ':',
+      mask: '*'
+    });
+
+    const candidateKey = (groqApiKey && groqApiKey.trim()) || envKey;
+    if (!candidateKey) {
+      console.log(chalk.red('  Groq API Key is required. Please paste a valid key.\n'));
+      continue;
+    }
+
+    const { createSpinner } = await import('../ui/renderer.js');
+    const probeSpinner = createSpinner('Validating Groq API Key & probing official quotas...').start();
+    const probeResult = await probeApiKey({ apiKey: candidateKey, model: defaults.models.small });
+
+    if (!probeResult.valid) {
+      probeSpinner.fail(chalk.red(`Groq API Key rejected (${probeResult.status ? `HTTP ${probeResult.status}` : 'HTTP 401'}). Please paste again.`));
+      if (probeResult.error) {
+        console.log(chalk.dim(`  Details: ${probeResult.error}\n`));
+      }
+      continue;
+    }
+
+    probeSpinner.succeed(chalk.green('Groq API Key verified successfully!'));
+    validKey = true;
+    finalGroqKey = candidateKey;
+    probeInfo = probeResult;
+
+    // Display Official Quota Profile Callout
+    console.log(chalk.bold.cyan('\n  Official Groq Quota Profile:'));
+    console.log(`  Plan Tier:          ${chalk.green(probeInfo.tier === 'developer' ? 'Developer Plan (Pay-As-You-Go)' : 'Free Plan')}`);
+    console.log(`  Model:              ${chalk.white(defaults.models.small)}`);
+    console.log(`  TPM (Tokens/Min):   ${chalk.green(probeInfo.limits.tpm.toLocaleString())} (Remaining: ${probeInfo.remaining.tpm.toLocaleString()})`);
+    console.log(`  RPD (Requests/Day): ${chalk.green(probeInfo.limits.rpd === Infinity ? 'Uncapped' : probeInfo.limits.rpd.toLocaleString())} (Remaining: ${probeInfo.remaining.rpd === Infinity ? 'Uncapped' : probeInfo.remaining.rpd.toLocaleString()})`);
+    console.log(`  RPM (Requests/Min): ${chalk.green(probeInfo.limits.rpm.toLocaleString())}`);
+    console.log(`  TPD (Tokens/Day):   ${chalk.green(probeInfo.limits.tpd === Infinity ? 'Pay-As-You-Go' : probeInfo.limits.tpd.toLocaleString())}\n`);
+  }
 
   const smallModel = await input({
     message: 'Small Fast Model ID (routing, summaries, compression):',
@@ -311,6 +354,9 @@ export async function runOnboardingWizard(cwd = process.cwd()) {
 
   const newConfig = {
     ...defaults,
+    apiTier: probeInfo?.tier === 'developer' ? 'paid' : 'free',
+    rateLimits: probeInfo?.limits || defaults.rateLimits,
+    cooldownSeconds: 45,
     projectTitle: projectTitle.trim() || 'Untitled Novel',
     writingStyle: finalStyle,
     enhancedWritingStyle,

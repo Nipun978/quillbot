@@ -3,34 +3,87 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { createPrompt, useState, useKeypress, usePrefix, isEnterKey, isUpKey, isDownKey } from '@inquirer/core';
+import {
+  createPrompt,
+  useState,
+  useRef,
+  useEffect,
+  useKeypress,
+  usePrefix,
+  isSpaceKey,
+  isEnterKey,
+  isUpKey,
+  isDownKey
+} from '@inquirer/core';
 import { input } from '@inquirer/prompts';
 import chalk from 'chalk';
 import { ensureStdinRaw, suspendStdinProtection } from './ttyManager.js';
 
 export const hotkeySelect = createPrompt((config, done) => {
-  const { message, choices = [] } = config;
+  const { message, choices = [], cooldownSeconds = 0, isPaid = false } = config;
   const [active, setActive] = useState(0);
+  const [countdown, setCountdown] = useState(Number(cooldownSeconds) || 0);
+  const [notice, setNotice] = useState('');
+  const countRef = useRef(countdown);
+  countRef.current = countdown;
   const prefix = usePrefix({ status: 'idle' });
 
+  const isCooldownAction = (val) => val === 'accept' || val === 'retry';
+
+  useEffect(() => {
+    if (countRef.current <= 0) return;
+    const timer = setInterval(() => {
+      if (countRef.current <= 1) {
+        clearInterval(timer);
+        countRef.current = 0;
+        setCountdown(0);
+        setNotice('');
+      } else {
+        const next = countRef.current - 1;
+        countRef.current = next;
+        setCountdown(next);
+      }
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
   useKeypress((key, rl) => {
-    // 1. Check single-letter hotkeys (e.g. a, r, e, p, d)
+    // 1. Developer / Paid Plan: Spacebar skips cooldown instantly for accept and retry
+    if (isPaid && isSpaceKey(key) && countRef.current > 0) {
+      countRef.current = 0;
+      setCountdown(0);
+      setNotice(chalk.green('✓ Cooldown skipped with [Space]. [A]ccept and [R]etry unlocked.'));
+      return;
+    }
+
+    // 2. Single-character hotkeys
     const char = (key.name || key.sequence || '').toLowerCase();
     const matchedChoice = choices.find((c) => c.key && c.key.toLowerCase() === char);
     if (matchedChoice) {
+      if (isCooldownAction(matchedChoice.value) && countRef.current > 0) {
+        const actionVerb = matchedChoice.value === 'retry' ? 'retry' : 'accept';
+        setNotice(chalk.yellow(`⏳ 45s Cooldown Active: ${countRef.current}s remaining before you can ${actionVerb}. (Review prose cadence).`));
+        return;
+      }
       done(matchedChoice.value);
       return;
     }
 
-    // 2. Check Enter key
+    // 3. Enter key
     if (isEnterKey(key)) {
-      if (choices[active]) {
-        done(choices[active].value);
+      const selectedChoice = choices[active];
+      if (selectedChoice) {
+        if (isCooldownAction(selectedChoice.value) && countRef.current > 0) {
+          const actionVerb = selectedChoice.value === 'retry' ? 'retry' : 'accept';
+          setNotice(chalk.yellow(`⏳ 45s Cooldown Active: ${countRef.current}s remaining before you can ${actionVerb}. (Review prose cadence).`));
+          return;
+        }
+        done(selectedChoice.value);
       }
       return;
     }
 
-    // 3. Arrow navigation
+    // 4. Arrow navigation
     if (isUpKey(key)) {
       setActive((active - 1 + choices.length) % choices.length);
     } else if (isDownKey(key)) {
@@ -41,12 +94,23 @@ export const hotkeySelect = createPrompt((config, done) => {
   const lines = [
     `${prefix} ${chalk.bold(message)}`,
     ...choices.map((c, idx) => {
+      let displayName = c.name;
+      if (isCooldownAction(c.value)) {
+        if (countdown > 0) {
+          displayName = isPaid
+            ? `${c.name} (${countdown}s - Press [Space] to skip)`
+            : `${c.name} (${countdown}s cooldown)`;
+        } else {
+          displayName = c.name;
+        }
+      }
       const isSelected = idx === active;
       const pointer = isSelected ? chalk.cyan('> ') : '  ';
-      return isSelected ? chalk.cyan.bold(`${pointer}${c.name}`) : `${pointer}${c.name}`;
+      return isSelected ? chalk.cyan.bold(`${pointer}${displayName}`) : `${pointer}${displayName}`;
     }),
+    notice ? notice : '',
     chalk.dim(`\nPress hotkey [${choices.filter((c) => c.key).map((c) => c.key.toUpperCase()).join('/')}] or ↑↓ navigate • ⏎ select`)
-  ];
+  ].filter(Boolean);
 
   return lines.join('\n');
 });
@@ -99,9 +163,42 @@ export async function promptReviewWorkflow({
   itemLabel = 'draft',
   allowPause = true,
   preferredEditor = '',
-  criticIssues = []
+  criticIssues = [],
+  cooldownSeconds = undefined,
+  isPaid = false,
+  quotaManager = null,
+  config = null,
+  model = ''
 }) {
   ensureStdinRaw();
+  const reviewStartTime = Date.now();
+
+  const effectiveIsPaid = Boolean(
+    isPaid ||
+    config?.apiTier === 'paid' ||
+    config?.apiTier === 'developer' ||
+    quotaManager?.isPaidTier?.()
+  );
+
+  let effectiveCooldown;
+  if (cooldownSeconds !== undefined) {
+    effectiveCooldown = Number(cooldownSeconds) || 0;
+  } else if (config?.cooldownSeconds !== undefined) {
+    effectiveCooldown = Number(config.cooldownSeconds) || 0;
+  } else {
+    // Default to 45 in interactive/production, 0 in non-interactive tests unless configured
+    effectiveCooldown = (typeof process !== 'undefined' && process.stdin?.isTTY) ? 45 : 0;
+  }
+
+  if (quotaManager && model) {
+    const snapshot = quotaManager.getModelSnapshot(model);
+    if (snapshot) {
+      const tpmRem = snapshot.remainingTpm?.toLocaleString?.() ?? snapshot.remainingTpm;
+      const rpdRem = snapshot.remainingRpd === Infinity ? 'Uncapped' : (snapshot.remainingRpd?.toLocaleString?.() ?? snapshot.remainingRpd);
+      console.log(chalk.dim(`  [Live Quota: ${model} | Remaining: ${tpmRem} TPM • ${rpdRem} RPD]`));
+    }
+  }
+
   const choices = [
     { key: 'a', name: '[A]ccept - Commit and proceed', value: 'accept' },
     { key: 'r', name: '[R]etry  - Regenerate with revision feedback', value: 'retry' },
@@ -124,7 +221,9 @@ export async function promptReviewWorkflow({
   try {
     action = await hotkeySelect({
       message: `Review ${itemLabel}:`,
-      choices
+      choices,
+      cooldownSeconds: effectiveCooldown,
+      isPaid: effectiveIsPaid
     });
   } catch (err) {
     if (err.name === 'ExitPromptError') {
@@ -162,7 +261,11 @@ export async function promptReviewWorkflow({
   if (action === 'edit') {
     const edited = await openInEditor(draftContent, preferredEditor);
     console.log(chalk.green(`\nSaved changes from editor.`));
-    // Verify if user wants to accept the edited content or retry again
+
+    // Calculate remaining cooldown: user editing in notepad counts toward cooldown time
+    const elapsedSeconds = Math.floor((Date.now() - reviewStartTime) / 1000);
+    const remainingCooldown = Math.max(0, effectiveCooldown - elapsedSeconds);
+
     let postEditAction;
     try {
       postEditAction = await hotkeySelect({
@@ -170,8 +273,10 @@ export async function promptReviewWorkflow({
         choices: [
           { key: 'a', name: '[A]ccept edited version', value: 'accept' },
           { key: 'r', name: '[R]e-edit in editor', value: 'edit_again' },
-          { key: 'd', name: '[D]iscard edits and keep original', value: 'discard' }
-        ]
+          { key: 'd', name: '[D]iscard edits and return to review', value: 'discard' }
+        ],
+        cooldownSeconds: remainingCooldown,
+        isPaid: effectiveIsPaid
       });
     } catch (err) {
       if (err.name === 'ExitPromptError') {
@@ -181,17 +286,37 @@ export async function promptReviewWorkflow({
     }
 
     if (postEditAction === 'edit_again') {
+      const updatedElapsed = Math.floor((Date.now() - reviewStartTime) / 1000);
+      const updatedRemaining = Math.max(0, effectiveCooldown - updatedElapsed);
       return promptReviewWorkflow({
         draftContent: edited,
         itemLabel,
         allowPause,
         preferredEditor,
-        criticIssues
+        criticIssues,
+        cooldownSeconds: updatedRemaining,
+        isPaid: effectiveIsPaid,
+        quotaManager,
+        config,
+        model
       });
     }
 
     if (postEditAction === 'discard') {
-      return { action: 'accept', content: draftContent };
+      const updatedElapsed = Math.floor((Date.now() - reviewStartTime) / 1000);
+      const updatedRemaining = Math.max(0, effectiveCooldown - updatedElapsed);
+      return promptReviewWorkflow({
+        draftContent,
+        itemLabel,
+        allowPause,
+        preferredEditor,
+        criticIssues,
+        cooldownSeconds: updatedRemaining,
+        isPaid: effectiveIsPaid,
+        quotaManager,
+        config,
+        model
+      });
     }
 
     return { action: 'accept', content: edited };
@@ -199,4 +324,3 @@ export async function promptReviewWorkflow({
 
   return { action: 'pause', content: draftContent };
 }
-

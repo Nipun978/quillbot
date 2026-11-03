@@ -299,7 +299,10 @@ export async function handleBibleCreate({
     draftContent: fileContent,
     itemLabel: `new Story Bible file story-bible/${filename}`,
     allowPause: false,
-    preferredEditor: config.editor
+    preferredEditor: config.editor,
+    quotaManager: groqClient?.quotaManager,
+    config,
+    model: config.models?.small || 'openai/gpt-oss-20b'
   });
 
   if (review.action === 'accept') {
@@ -390,7 +393,10 @@ export async function handleBibleEdit({
       draftContent: edited,
       itemLabel: `edited story-bible/${filename}`,
       allowPause: false,
-      preferredEditor: config.editor
+      preferredEditor: config.editor,
+    quotaManager: groqClient?.quotaManager,
+    config,
+    model: config.models?.small || 'openai/gpt-oss-20b'
     });
 
     if (review.action === 'accept') {
@@ -451,7 +457,10 @@ export async function handleBibleEdit({
       draftContent: updatedContent,
       itemLabel: `updated story-bible/${filename}`,
       allowPause: false,
-      preferredEditor: config.editor
+      preferredEditor: config.editor,
+    quotaManager: groqClient?.quotaManager,
+    config,
+    model: config.models?.small || 'openai/gpt-oss-20b'
     });
 
     if (review.action === 'accept') {
@@ -558,7 +567,10 @@ ${extracted.markdownContent}
     draftContent: extracted.markdownContent,
     itemLabel: `addition to story-bible/${targetFileName}`,
     allowPause: false,
-    preferredEditor: config.editor
+    preferredEditor: config.editor,
+    quotaManager: groqClient?.quotaManager,
+    config,
+    model: config.models?.small || 'openai/gpt-oss-20b'
   });
 
   if (review.action === 'accept') {
