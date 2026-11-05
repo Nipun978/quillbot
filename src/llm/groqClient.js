@@ -115,7 +115,15 @@ export class GroqClient {
           await this.quotaManager.recordHeaders(resolvedModel, headers, usage, this.cwd);
         }
 
-        const result = response?.choices?.[0]?.message?.content || '';
+        const msg = response?.choices?.[0]?.message;
+        let result = msg?.content || '';
+        if (typeof result === 'string' && result.includes('</think>')) {
+          const afterThink = result.slice(result.indexOf('</think>') + 8).trim();
+          if (afterThink) {
+            result = afterThink;
+          }
+        }
+
         await logLlmPayload({
           cwd: this.cwd,
           sessionId,

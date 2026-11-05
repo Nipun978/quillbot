@@ -5,16 +5,39 @@ import {
   WRITE_BEAT_SYSTEM_PROMPT,
   CHAPTER_SUMMARY_SYSTEM_PROMPT,
   CONTINUITY_CRITIC_SYSTEM_PROMPT,
-  buildHierarchyContext
+  buildHierarchyContext,
+  buildStoryBibleContext
 } from '../llm/prompts.js';
 import { loadInstructions } from '../config/configManager.js';
 import { createBackup } from '../config/backupManager.js';
-import { setActiveBeat } from '../config/stateManager.js';
+import { setActiveBeat, loadState } from '../config/stateManager.js';
 import { padChapter } from './planChapter.js';
 import { createSpinner } from '../ui/renderer.js';
 import { promptReviewWorkflow } from '../ui/reviewPrompt.js';
 import { syncAllFiles } from '../rag/fileSync.js';
 import { ensureStdinRaw } from '../ui/ttyManager.js';
+import {
+  loadStoryContextForChapter,
+  loadCondensedBeats,
+  loadWritingContinuityContext,
+  saveCondensedBeatProse,
+  saveCondensedBeatPlan,
+  condenseBeatPlan,
+  condenseChapterProse,
+  updateStorySoFar
+} from '../config/condensedManager.js';
+
+export function parseChapterPlanHeader(planContent = '') {
+  if (!planContent) return { title: '', chapterSummary: '', chapterInstructions: '' };
+  const titleMatch = planContent.match(/^#\s+(?:Chapter\s+\d+:\s*)?(.*?)$/m);
+  const summaryMatch = planContent.match(/##\s+Chapter Summary\s*\n([\s\S]*?)(?=\n##\s+|$)/i);
+  const instrMatch = planContent.match(/##\s+Chapter Instructions\s*\n([\s\S]*?)(?=\n##\s+|$)/i);
+  return {
+    title: titleMatch ? titleMatch[1].trim() : '',
+    chapterSummary: summaryMatch ? summaryMatch[1].trim() : '',
+    chapterInstructions: instrMatch ? instrMatch[1].trim() : ''
+  };
+}
 
 export function parseBeatsFromPlan(planContent) {
   const beatRegex = /^### Beat (\d+): (.*?)$/gm;
@@ -37,8 +60,9 @@ export function parseBeatsFromPlan(planContent) {
 
     const charsMatch = fullBlock.match(/(?:-\s*)?\*\*Characters:\*\*\s*([^\n\r]+)/i);
     const locMatch = fullBlock.match(/(?:-\s*)?\*\*Location:\*\*\s*([^\n\r]+)/i);
-    const actMatch = fullBlock.match(/(?:-\s*)?\*\*Action:\*\*\s*([\s\S]*?)(?=(?:(?:-\s*)?\*\*Goal\/Hook:\*\*)|$)/i);
-    const goalMatch = fullBlock.match(/(?:-\s*)?\*\*Goal\/Hook:\*\*\s*([\s\S]*?)$/i);
+    const actMatch = fullBlock.match(/(?:-\s*)?\*\*Action:\*\*\s*([\s\S]*?)(?=(?:(?:-\s*)?\*\*Goal\/Hook:\*\*)|(?:(?:-\s*)?\*\*Instructions:\*\*)|$)/i);
+    const goalMatch = fullBlock.match(/(?:-\s*)?\*\*Goal\/Hook:\*\*\s*([\s\S]*?)(?=(?:(?:-\s*)?\*\*Instructions:\*\*)|$)/i);
+    const instrMatch = fullBlock.match(/(?:-\s*)?\*\*Instructions:\*\*\s*([\s\S]*?)$/i);
 
     beats.push({
       num: indices[i].beatNum,
@@ -47,6 +71,7 @@ export function parseBeatsFromPlan(planContent) {
       location: locMatch ? locMatch[1].trim() : '',
       action: actMatch ? actMatch[1].trim() : '',
       goalHook: goalMatch ? goalMatch[1].trim() : '',
+      instructions: instrMatch ? instrMatch[1].trim() : '',
       rawBlock: fullBlock
     });
   }
@@ -538,39 +563,43 @@ export async function runWriteChapterWorkflow({
       }
     }
 
-    // Previous beats summaries in this chapter
-    const beatIndexInFullPlan = beats.findIndex((x) => x.num === beat.num);
-    const previousBeatsList = beats.slice(0, beatIndexInFullPlan).map((prev) =>
-      `- Beat ${prev.num} (${prev.title}): ${prev.action}`
-    ).join('\n');
+    // 4. Prompt Assembly (Optimized for Groq Prefix Caching & Deterministic Continuity)
+    const { title: chapterTitle, chapterSummary, chapterInstructions } = parseChapterPlanHeader(planContent);
 
-    // 4. Prompt Assembly (Optimized for Groq Prefix Caching)
-    const hierarchyXml = buildHierarchyContext({
-      instructions,
-      tier1Chunks: tier1,
-      tier2Chunks: tier2,
-      rollingSummary: conversationMgr?.getRollingSummary ? conversationMgr.getRollingSummary() : ''
+    // Requirement 5: Story So Far (1..N-2) & Preceding Chapter Summary (N-1) loaded deterministically
+    const { storySoFar, previousChapterSummary } = await loadStoryContextForChapter({
+      currentChapterNum: chapterNum,
+      cwd
     });
 
+    // Requirement 6: Prior condensed prose, trailing snippet, and next beat foresight
+    const {
+      priorCondensedProse,
+      lastProseSnippet: tailSnippet,
+      nextBeatCondensedPlan,
+      isFinaleBeat
+    } = await loadWritingContinuityContext({
+      chapterNum,
+      activeBeatNum: beat.num,
+      beatsList: beats,
+      cwd,
+      chapterFile
+    });
+
+    const activeLastSnippet = lastProseSnippet || tailSnippet;
+
     const activeStyle = config.enhancedWritingStyle
-      ? `${config.enhancedWritingStyle}\n\nAuthor Core Preferences: ${config.writingStyle}`
+      ? config.enhancedWritingStyle.trim()
       : (config.writingStyle || '');
 
-    // Static prefix: instructions + full plan + writing style rules
-    const systemPrompt = `${hierarchyXml}
+    // STATIC PREFIX (System Message): Byte-identical for EVERY beat in Chapter N to maximize Groq prefix caching
+    const systemPrompt = `You are an acclaimed novelist writing narrative prose for a novel chapter.
+You write ONE BEAT at a time with uncompromising psychological depth, sensory immersion, and scene grounding.
 
-<chapter_plan_static_prefix>
-${planContent.trim()}
-</chapter_plan_static_prefix>
-
-<writing_style_rules>
-Author's Writing Style & Prose Requirements:
-${activeStyle || '(Standard literary prose guidelines)'}
-
-CRITICAL EXECUTION RULE:
-You must strictly embody and adhere to this exact writing style, narrative distance, voice, sentence rhythm, and sensory grounding when writing this beat.
-</writing_style_rules>
-
+<global_writing_instructions>
+${activeStyle || '(Deliver immersive, sensory-rich prose in consistent POV and tense.)'}
+</global_writing_instructions>
+${chapterInstructions ? `\n<chapter_writing_instructions>\n${chapterInstructions}\n</chapter_writing_instructions>\n` : ''}
 ${WRITE_BEAT_SYSTEM_PROMPT}`;
 
     let revisionBlock = '';
@@ -591,26 +620,47 @@ ${beatEditNotes || 'Enhance the sensory immersion, dialogue rhythm, emotional de
 4. Output only the continuous, revised narrative prose for Beat ${beat.num}.`;
     }
 
+    const storyBibleXml = tier1.length > 0 ? buildStoryBibleContext(tier1) : '';
+
+    const macroContinuityBlock = [
+      storySoFar ? `### Story So Far (Chapters 1 to ${Math.max(1, chapterNum - 2)}):\n${storySoFar}` : '',
+      previousChapterSummary ? `### Chapter ${chapterNum - 1} Summary:\n${previousChapterSummary}` : '',
+      chapterSummary ? `### Chapter ${chapterNum} Summary:\n${chapterSummary}` : ''
+    ].filter(Boolean).join('\n\n');
+
+    const sceneProgressionBlock = priorCondensedProse.length > 0
+      ? `### Preceding Scenes in Chapter ${chapterNum} (Narrative Progression):\n${priorCondensedProse.map((p) => `- ${p}`).join('\n')}`
+      : '(Opening beat of this chapter)';
+
+    const foresightBlock = nextBeatCondensedPlan
+      ? `### Next Scene Foresight Horizon (Next Planned Beat):\n${nextBeatCondensedPlan}`
+      : isFinaleBeat
+        ? '### Scene Foresight Horizon:\n(Chapter Climax & Resolution Beat - bring this chapter arc to a natural closing point)'
+        : '';
+
     let beatProse = '';
     let retryFeedback = '';
     let beatAccepted = false;
 
     while (!beatAccepted) {
       // Dynamic suffix per beat
-      const dynamicUserPrompt = `
-### Immediate Narrative Continuity:
-${previousBeatsList ? `#### Earlier Beats in Chapter ${chapterNum}:\n${previousBeatsList}\n` : ''}
+      const dynamicUserPrompt = `${storyBibleXml ? `${storyBibleXml}\n\n` : ''}${macroContinuityBlock ? `<macro_story_continuity>\n${macroContinuityBlock}\n</macro_story_continuity>\n\n` : ''}<chapter_scene_progression>
+${sceneProgressionBlock}
+</chapter_scene_progression>
+
+### Immediate Narrative Seam:
 #### Verbatim Final Words from Preceding Scene:
-${lastProseSnippet ? `"...${lastProseSnippet}"` : '(Opening of the chapter - establish setting and atmosphere)'}
+${activeLastSnippet ? `"...${activeLastSnippet}"` : '(Opening of the chapter - establish setting and atmosphere)'}
 ${downstreamContext ? `\n${downstreamContext}` : ''}
-### TARGET BEAT TO WRITE NOW:
+
+### TARGET BEAT TO WRITE NOW (ACTIVE BEAT FULL PLAN):
 - **Beat Number:** ${beat.num}
 - **Beat Title:** ${beat.title}
-- **Characters Present:** ${beat.characters}
-- **Location:** ${beat.location}
-- **Required Action & Beat Event:** ${beat.action}
-- **Goal / Scene Hook:** ${beat.goalHook}
-${revisionBlock ? `\n${revisionBlock}` : ''}
+- **Characters Present:** ${beat.characters || 'Unspecified'}
+- **Location:** ${beat.location || 'Unspecified'}
+- **Action & Event:** ${beat.action || 'Unspecified'}
+- **Goal / Scene Hook:** ${beat.goalHook || 'Unspecified'}
+${beat.instructions ? `- **Beat Writing Instructions:** ${beat.instructions}\n` : ''}${foresightBlock ? `\n${foresightBlock}\n` : ''}${revisionBlock ? `\n${revisionBlock}` : ''}
 ${retryFeedback ? `\n### Revision Notes (from previous attempt):\n${retryFeedback}\n` : ''}
 ${isRevision ? `Write the revised and improved narrative prose for Beat ${beat.num}.` : `Write the continuous narrative prose for Beat ${beat.num}.`}`;
 
@@ -710,6 +760,23 @@ ${isRevision ? `Write the revised and improved narrative prose for Beat ${beat.n
           cwd
         });
 
+        // Condense beat prose into .condensed/chapters/chapter-XX/prose.md
+        const condenseSpinner = createSpinner(`Condensing Beat ${beat.num} prose with 20B model...`).start();
+        try {
+          await saveCondensedBeatProse({
+            chapterNum,
+            beatNum: beat.num,
+            beatTitle: beat.title,
+            proseText: finalProse,
+            groqClient,
+            cwd,
+            config
+          });
+          condenseSpinner.succeed(`Beat ${beat.num} prose condensed into .condensed/chapters/chapter-${padded}/prose.md`);
+        } catch (err) {
+          condenseSpinner.fail(`Failed to condense Beat ${beat.num} prose: ${err.message}`);
+        }
+
         if (isTargetedBeat) {
           console.log(chalk.green(`\nBeat ${beat.num} rewritten and updated in project/chapter-${padded}/chapter.md`));
 
@@ -781,6 +848,30 @@ export async function generateChapterSummary({
     await createBackup(summaryFile, cwd);
     await fs.writeFile(summaryFile, summaryText.trim(), 'utf8');
     spinner.succeed(`Saved summary to project/chapter-${padChapter(chapterNum)}/summary.md`);
+
+    // Requirement 4 & 5: Update story-so-far.md
+    let chapterTitle = '';
+    try {
+      const planFile = path.join(cwd, 'project', `chapter-${padChapter(chapterNum)}`, 'plan.md');
+      const planContent = await fs.readFile(planFile, 'utf8');
+      const header = parseChapterPlanHeader(planContent);
+      chapterTitle = header.title || '';
+    } catch {}
+
+    const ssfSpinner = createSpinner('Condensing chapter summary into Story So Far with 20B model...').start();
+    try {
+      await updateStorySoFar({
+        chapterNum,
+        chapterTitle,
+        summaryText,
+        groqClient,
+        cwd,
+        config
+      });
+      ssfSpinner.succeed('Updated .condensed/story-so-far.md.');
+    } catch (err) {
+      ssfSpinner.fail(`Failed to update Story So Far: ${err.message}`);
+    }
 
     const syncSpinner = createSpinner('Syncing full chapter and canonical summary to LanceDB...').start();
     await syncAllFiles({ cwd, vectorStore, embedder, config });
@@ -937,6 +1028,25 @@ Revise and polish Chapter ${chapterNum} according to the editorial direction. El
     const { header, beatsMap } = parseChapterBeats(review.content);
     if (beatsMap.size > 0) {
       await fs.writeFile(chapterFile, serializeChapterBeats(header, beatsMap), 'utf8');
+
+      // Re-condense revised beats into .condensed/chapters/chapter-XX/prose.md
+      const condenseSpinner = createSpinner(`Re-condensing ${beatsMap.size} revised beats with 20B model...`).start();
+      try {
+        for (const [beatNum, beatProse] of beatsMap.entries()) {
+          await saveCondensedBeatProse({
+            chapterNum,
+            beatNum,
+            beatTitle: `Scene ${beatNum}`,
+            proseText: beatProse,
+            groqClient,
+            cwd,
+            config
+          });
+        }
+        condenseSpinner.succeed(`Revised beats condensed into .condensed/chapters/chapter-${padded}/prose.md`);
+      } catch (err) {
+        condenseSpinner.fail(`Failed to re-condense revised beats: ${err.message}`);
+      }
     } else {
       await fs.writeFile(chapterFile, review.content.trim() + '\n', 'utf8');
     }

@@ -4,17 +4,27 @@ import { input, select } from '@inquirer/prompts';
 import chalk from 'chalk';
 import {
   PLAN_CHAPTER_SYSTEM_PROMPT,
+  PLAN_CHAPTER_HEADER_SYSTEM_PROMPT,
   PLAN_SINGLE_BEAT_SYSTEM_PROMPT,
-  buildHierarchyContext
+  buildHierarchyContext,
+  buildStoryBibleContext
 } from '../llm/prompts.js';
 import { loadInstructions } from '../config/configManager.js';
-import { setActiveBeat } from '../config/stateManager.js';
+import { setActiveBeat, loadState } from '../config/stateManager.js';
 import { createBackup } from '../config/backupManager.js';
-import { parseBeatsFromPlan } from './writeChapter.js';
+import { parseBeatsFromPlan, parseChapterPlanHeader } from './writeChapter.js';
 import { createSpinner, printMarkdown } from '../ui/renderer.js';
 import { promptReviewWorkflow } from '../ui/reviewPrompt.js';
 import { syncAllFiles } from '../rag/fileSync.js';
 import { ensureStdinRaw } from '../ui/ttyManager.js';
+import {
+  saveCondensedBeatPlan,
+  loadPlanningContinuityContext,
+  loadStoryContextForChapter,
+  condenseBeatPlan,
+  condenseChapterPlan,
+  loadCondensedBeats
+} from '../config/condensedManager.js';
 
 export function padChapter(num) {
   return String(num).padStart(2, '0');
@@ -59,7 +69,10 @@ export function updateBeatInPlan(planContent = '', targetBeatNum, newBeatBlock =
   const matches = [...planContent.matchAll(beatRegex)];
 
   if (matches.length === 0) {
-    // No beats found, append to plan
+    // No beats found yet
+    if (planContent.includes('## Beats')) {
+      return `${planContent.trim()}\n\n${newBeatBlock.trim()}\n`;
+    }
     return `${planContent.trim()}\n\n## Beats\n\n${newBeatBlock.trim()}\n`;
   }
 
@@ -227,7 +240,8 @@ Generate the beat block for Beat ${targetNum} matching:
 - **Characters:** [Names]
 - **Location:** [Location]
 - **Action:** [Paragraph describing the beat events]
-- **Goal/Hook:** [Paragraph describing resolution and hook]`;
+- **Goal/Hook:** [Paragraph describing resolution and hook]
+- **Instructions:** [Short and to the point beat-level writing instructions]`;
 
       if (groqClient?.quotaManager) {
         const cd = config?.cooldownSeconds !== undefined ? config.cooldownSeconds : (process.stdin?.isTTY ? 45 : 0);
@@ -243,7 +257,8 @@ Generate the beat block for Beat ${targetNum} matching:
           { role: 'system', content: PLAN_SINGLE_BEAT_SYSTEM_PROMPT },
           { role: 'user', content: userPrompt }
         ],
-        temperature: config.generation?.temperaturePlan || 0.6
+        temperature: config.generation?.temperaturePlan || 0.6,
+        workflow: 'PLAN_BEAT'
       });
 
       beatSpinner.succeed(`Generated Beat ${targetNum} plan.`);
@@ -282,6 +297,25 @@ Generate the beat block for Beat ${targetNum} matching:
 
   const updatedPlan = updateBeatInPlan(existingPlan, targetNum, finalBeatPlan);
   await fs.writeFile(planFile, updatedPlan, 'utf8');
+
+  // Condense beat plan in .condensed/chapters/chapter-XX/plan.md
+  const updatedBeats = parseBeatsFromPlan(updatedPlan);
+  const matched = updatedBeats.find((b) => b.num === targetNum) || { num: targetNum, title: `Beat ${targetNum}`, rawBlock: finalBeatPlan };
+  const condenseSpinner = createSpinner(`Condensing Beat ${targetNum} plan with 20B model...`).start();
+  try {
+    await saveCondensedBeatPlan({
+      chapterNum,
+      beatNum: targetNum,
+      beatTitle: matched.title,
+      planText: finalBeatPlan,
+      groqClient,
+      cwd,
+      config
+    });
+    condenseSpinner.succeed(`Beat ${targetNum} plan condensed into .condensed/chapters/chapter-${padded}/plan.md`);
+  } catch (err) {
+    condenseSpinner.fail(`Failed to condense Beat ${targetNum} plan: ${err.message}`);
+  }
 
   console.log(chalk.green(`\nBeat ${targetNum} saved into project/chapter-${padded}/plan.md`));
 
@@ -533,25 +567,294 @@ export async function runPlanChapterWorkflow({
     rollingSummary: conversationMgr?.getRollingSummary ? conversationMgr.getRollingSummary() : ''
   });
 
-  let currentFeedback = '';
-  let accepted = false;
   let finalPlan = '';
 
-  while (!accepted) {
-    const planSpinner = createSpinner(
-      isEditingFullPlan
-        ? `Revising Beat Plan for Chapter ${chapterNum}...`
-        : `Drafting Beat Plan for Chapter ${chapterNum}...`
-    ).start();
+  if (!isEditingFullPlan) {
+    // REQUIREMENT 9: Planning a chapter without a specific target beat works beat-by-beat over multiple requests
+    console.log(chalk.bold.cyan(`\n  Step 1: Planning Chapter ${chapterNum} Foundation (Summary & Instructions)...`));
 
-    try {
-      const activeStyle = config.enhancedWritingStyle
-        ? `${config.enhancedWritingStyle}\n\nAuthor Core Preferences: ${config.writingStyle}`
-        : (config.writingStyle || '');
+    const activeStyle = config.enhancedWritingStyle
+      ? config.enhancedWritingStyle.trim()
+      : (config.writingStyle || '');
 
-      let userPrompt = '';
-      if (isEditingFullPlan) {
-        userPrompt = `${hierarchyXml}
+    // 1. Plan Chapter Header
+    let headerAccepted = false;
+    let headerFeedback = '';
+    let chapterHeaderContent = '';
+
+    while (!headerAccepted) {
+      const headerSpinner = createSpinner(`Drafting Chapter ${chapterNum} Summary & Chapter Instructions...`).start();
+      try {
+        const headerPrompt = `${hierarchyXml}
+
+<writing_style_rules>
+${activeStyle || '(Standard literary prose guidelines)'}
+</writing_style_rules>
+
+Target: Chapter ${chapterNum}
+Author Guidance / Core Conflict:
+${guidance.trim() || '(Rely on Story Bible and previous chapter arc)'}
+${headerFeedback ? `\nRevision Feedback:\n${headerFeedback}` : ''}
+
+Draft the Chapter Title, Chapter Summary (1-2 paragraphs), and Chapter Instructions (under 50 words) adhering strictly to the schema.`;
+
+        if (groqClient?.quotaManager) {
+          const cd = config?.cooldownSeconds !== undefined ? config.cooldownSeconds : (process.stdin?.isTTY ? 45 : 0);
+          await groqClient.quotaManager.enforceGenerationCooldown({
+            cooldownSeconds: cd,
+            isPaid: config?.apiTier === 'paid' || config?.apiTier === 'developer'
+          });
+        }
+
+        chapterHeaderContent = await groqClient.chatCompletion({
+          model: 'large',
+          messages: [
+            { role: 'system', content: PLAN_CHAPTER_HEADER_SYSTEM_PROMPT },
+            { role: 'user', content: headerPrompt }
+          ],
+          temperature: config.generation?.temperaturePlan || 0.6
+        });
+
+        headerSpinner.succeed(`Drafted Chapter ${chapterNum} Foundation.`);
+        if (groqClient?.quotaManager) {
+          groqClient.quotaManager.recordGenerationEnd();
+        }
+      } catch (err) {
+        headerSpinner.fail(`Failed to draft chapter foundation: ${err.message}`);
+        return;
+      }
+
+      console.log('\n' + chalk.bold.magenta(`--- Chapter ${chapterNum} Foundation Preview ---`));
+      printMarkdown(chapterHeaderContent);
+
+      const review = await promptReviewWorkflow({
+        draftContent: chapterHeaderContent,
+        itemLabel: `Chapter ${chapterNum} Foundation`,
+        allowPause: false,
+        preferredEditor: config.editor,
+        quotaManager: groqClient?.quotaManager,
+        config,
+        model: config.models?.large || 'openai/gpt-oss-120b'
+      });
+
+      if (review.action === 'accept') {
+        chapterHeaderContent = review.content.trim();
+        headerAccepted = true;
+      } else if (review.action === 'retry') {
+        headerFeedback = review.feedback || 'Please refine the chapter summary and tone instructions.';
+      }
+    }
+
+    // Save initial skeleton plan.md
+    await fs.mkdir(chapterDir, { recursive: true });
+    let currentPlanMarkdown = `${chapterHeaderContent}\n\n## Beats\n`;
+    await fs.writeFile(planFile, currentPlanMarkdown, 'utf8');
+
+    // Parse header
+    const { title: chTitle, chapterSummary: chSummary, chapterInstructions: chInstructions } = parseChapterPlanHeader(currentPlanMarkdown);
+
+    // 2. Plan Beats sequentially over multiple requests (Beats 1, 2, 3...)
+    let currentBeatNum = 1;
+    let continuePlanningBeats = true;
+
+    while (continuePlanningBeats) {
+      console.log(chalk.bold.cyan(`\n  Step 2.${currentBeatNum}: Planning Beat ${currentBeatNum} for Chapter ${chapterNum}`));
+
+      let beatGuidance = '';
+      ensureStdinRaw();
+      if (process.stdin.isTTY) {
+        try {
+          beatGuidance = await input({
+            message: `What should happen in Beat ${currentBeatNum}? (Brief ideas or press Enter for AI direction):`
+          });
+        } catch {}
+      }
+
+      const existingPlanSoFar = await fs.readFile(planFile, 'utf8');
+      const beatsSoFar = parseBeatsFromPlan(existingPlanSoFar);
+
+      // Requirement 5: Story So Far (1..N-2) & Preceding Chapter Summary (N-1) loaded deterministically
+      const { storySoFar, previousChapterSummary } = await loadStoryContextForChapter({
+        currentChapterNum: chapterNum,
+        cwd
+      });
+
+      // Requirement 5: Complete plan of Beat K-1 & condensed plans of prior beats
+      const { previousBeatPlan, priorCondensedPlans } = await loadPlanningContinuityContext({
+        chapterNum,
+        activeBeatNum: currentBeatNum,
+        allBeatsInPlan: beatsSoFar,
+        cwd
+      });
+
+      let beatPlanDraft = '';
+      let beatAccepted = false;
+      let beatFeedback = '';
+
+      while (!beatAccepted) {
+        const beatSpinner = createSpinner(`Drafting Beat ${currentBeatNum} Plan...`).start();
+        try {
+          const storyBibleXml = tier1.length > 0 ? buildStoryBibleContext(tier1) : '';
+
+          const macroContinuityBlock = [
+            storySoFar ? `### Story So Far (Chapters 1 to ${Math.max(1, chapterNum - 2)}):\n${storySoFar}` : '',
+            previousChapterSummary ? `### Chapter ${chapterNum - 1} Summary:\n${previousChapterSummary}` : ''
+          ].filter(Boolean).join('\n\n');
+
+          const beatContextBlock = [
+            priorCondensedPlans.length > 0 ? `### Prior Beats in Chapter ${chapterNum} (Condensed Plans):\n${priorCondensedPlans.map((p) => `- ${p}`).join('\n')}` : '',
+            previousBeatPlan ? `### Immediate Preceding Beat Plan (Beat ${currentBeatNum - 1} Full Plan):\n${previousBeatPlan}` : ''
+          ].filter(Boolean).join('\n\n') || '(First beat of this chapter)';
+
+          const beatUserPrompt = `${storyBibleXml ? `${storyBibleXml}\n\n` : ''}${macroContinuityBlock ? `<macro_story_continuity>\n${macroContinuityBlock}\n</macro_story_continuity>\n\n` : ''}<chapter_foundation>
+Chapter Title: ${chTitle || `Chapter ${chapterNum}`}
+Chapter Summary: ${chSummary}
+${chInstructions ? `Chapter Instructions: ${chInstructions}` : ''}
+</chapter_foundation>
+
+<chapter_beats_context>
+${beatContextBlock}
+</chapter_beats_context>
+
+<writing_style_rules>
+${activeStyle || '(Standard literary prose guidelines)'}
+</writing_style_rules>
+
+### OBJECTIVE FOR BEAT ${currentBeatNum}:
+${beatGuidance.trim() || 'Advance the chapter narrative arc with rich character tension and sensory specifics.'}
+${beatFeedback ? `\nRevision Feedback from previous attempt:\n${beatFeedback}` : ''}
+
+Generate the beat block for Beat ${currentBeatNum} matching:
+### Beat ${currentBeatNum}: [Title]
+- **Characters:** [Names]
+- **Location:** [Location]
+- **Action:** [Paragraph describing the beat events]
+- **Goal/Hook:** [Paragraph describing resolution and hook]
+- **Instructions:** [Short and to the point beat-level writing instructions]`;
+
+          if (groqClient?.quotaManager) {
+            const cd = config?.cooldownSeconds !== undefined ? config.cooldownSeconds : (process.stdin?.isTTY ? 45 : 0);
+            await groqClient.quotaManager.enforceGenerationCooldown({
+              cooldownSeconds: cd,
+              isPaid: config?.apiTier === 'paid' || config?.apiTier === 'developer'
+            });
+          }
+
+          beatPlanDraft = await groqClient.chatCompletion({
+            model: 'large',
+            messages: [
+              { role: 'system', content: PLAN_SINGLE_BEAT_SYSTEM_PROMPT },
+              { role: 'user', content: beatUserPrompt }
+            ],
+            temperature: config.generation?.temperaturePlan || 0.6
+          });
+
+          beatSpinner.succeed(`Drafted Beat ${currentBeatNum} Plan.`);
+          if (groqClient?.quotaManager) {
+            groqClient.quotaManager.recordGenerationEnd();
+          }
+        } catch (err) {
+          beatSpinner.fail(`Failed to draft beat plan: ${err.message}`);
+          return;
+        }
+
+        console.log('\n' + chalk.bold.magenta(`--- Beat ${currentBeatNum} Plan Preview ---`));
+        printMarkdown(beatPlanDraft);
+
+        const beatReview = await promptReviewWorkflow({
+          draftContent: beatPlanDraft,
+          itemLabel: `Chapter ${chapterNum} Beat ${currentBeatNum} Plan`,
+          allowPause: true,
+          preferredEditor: config.editor,
+          quotaManager: groqClient?.quotaManager,
+          config,
+          model: config.models?.large || 'openai/gpt-oss-120b'
+        });
+
+        if (beatReview.action === 'accept') {
+          beatPlanDraft = beatReview.content.trim();
+          beatAccepted = true;
+
+          // Append to plan.md
+          currentPlanMarkdown = updateBeatInPlan(currentPlanMarkdown, currentBeatNum, beatPlanDraft);
+          await fs.writeFile(planFile, currentPlanMarkdown, 'utf8');
+
+          // Condense beat in .condensed/chapters/chapter-XX/plan.md
+          const allBeats = parseBeatsFromPlan(currentPlanMarkdown);
+          const currentBeatObj = allBeats.find((b) => b.num === currentBeatNum) || { num: currentBeatNum, title: `Beat ${currentBeatNum}`, rawBlock: beatPlanDraft };
+          const condenseSpinner = createSpinner(`Condensing Beat ${currentBeatNum} plan with 20B model...`).start();
+          try {
+            await saveCondensedBeatPlan({
+              chapterNum,
+              beatNum: currentBeatNum,
+              beatTitle: currentBeatObj.title,
+              planText: beatPlanDraft,
+              groqClient,
+              cwd,
+              config
+            });
+            condenseSpinner.succeed(`Beat ${currentBeatNum} plan condensed into .condensed/chapters/chapter-${padded}/plan.md`);
+          } catch (err) {
+            condenseSpinner.fail(`Failed to condense Beat ${currentBeatNum} plan: ${err.message}`);
+          }
+
+          console.log(chalk.green(`\nBeat ${currentBeatNum} saved into project/chapter-${padded}/plan.md`));
+
+          // Ask to continue or finish
+          if (currentBeatNum >= 2 && process.stdin.isTTY) {
+            ensureStdinRaw();
+            try {
+              const nextChoice = await select({
+                message: `Beat ${currentBeatNum} planned. What would you like to do next?`,
+                choices: [
+                  { name: `Plan Beat ${currentBeatNum + 1}`, value: 'next' },
+                  { name: `Finish Chapter ${chapterNum} Plan (${currentBeatNum} beats total)`, value: 'finish' }
+                ]
+              });
+              if (nextChoice === 'finish') {
+                continuePlanningBeats = false;
+              } else {
+                currentBeatNum++;
+              }
+            } catch {
+              if (currentBeatNum >= 3) {
+                continuePlanningBeats = false;
+              } else {
+                currentBeatNum++;
+              }
+            }
+          } else {
+            // Default 3 beats if non-TTY or tests
+            if (currentBeatNum >= 3 && !process.stdin.isTTY) {
+              continuePlanningBeats = false;
+            } else {
+              currentBeatNum++;
+            }
+          }
+        } else if (beatReview.action === 'retry') {
+          beatFeedback = beatReview.feedback || 'Please refine the action, character motivation, and scene instructions.';
+        } else if (beatReview.action === 'pause') {
+          console.log(chalk.yellow(`\nPlanning paused at Beat ${currentBeatNum}. Progress saved in project/chapter-${padded}/plan.md. Resume with /plan ${chapterNum}`));
+          return;
+        }
+      }
+    }
+
+    finalPlan = currentPlanMarkdown;
+  } else {
+    // isEditingFullPlan: revise full plan
+    let currentFeedback = '';
+    let accepted = false;
+
+    while (!accepted) {
+      const planSpinner = createSpinner(`Revising Beat Plan for Chapter ${chapterNum}...`).start();
+
+      try {
+        const activeStyle = config.enhancedWritingStyle
+          ? `${config.enhancedWritingStyle}\n\nAuthor Core Preferences: ${config.writingStyle}`
+          : (config.writingStyle || '');
+
+        const userPrompt = `${hierarchyXml}
 
 <writing_style_and_pacing_rules>
 Author's Writing Style & Tone Specification:
@@ -574,81 +877,60 @@ You are editing and improving the existing Chapter ${chapterNum} plan above acco
 - Retain strong beats, characters, and established events from the existing plan.
 - Address the author's revision guidance.
 - Output the complete, revised Chapter ${chapterNum} plan matching the strict Beat schema.`;
-      } else {
-        userPrompt = `${hierarchyXml}
 
-<writing_style_and_pacing_rules>
-Author's Writing Style & Tone Specification:
-${activeStyle || '(Standard literary prose guidelines)'}
+        if (groqClient?.quotaManager) {
+          const cd = config?.cooldownSeconds !== undefined ? config.cooldownSeconds : (process.stdin?.isTTY ? 45 : 0);
+          await groqClient.quotaManager.enforceGenerationCooldown({
+            cooldownSeconds: cd,
+            isPaid: config?.apiTier === 'paid' || config?.apiTier === 'developer'
+          });
+        }
 
-CRITICAL: Embody this exact tone, psychological depth, and stylistic pacing in every beat's Action and Goal/Hook description.
-</writing_style_and_pacing_rules>
-
-Target: Chapter ${chapterNum}
-Author Guidance / Core Conflict:
-${guidance.trim() || '(Rely on Story Bible and previous chapter arc)'}
-${currentFeedback ? `\nRevision Feedback:\n${currentFeedback}` : ''}
-
-Generate the complete Chapter ${chapterNum} plan using the strict Beat schema.`;
-      }
-
-      if (groqClient?.quotaManager) {
-        const cd = config?.cooldownSeconds !== undefined ? config.cooldownSeconds : (process.stdin?.isTTY ? 45 : 0);
-        await groqClient.quotaManager.enforceGenerationCooldown({
-          cooldownSeconds: cd,
-          isPaid: config?.apiTier === 'paid' || config?.apiTier === 'developer'
+        finalPlan = await groqClient.chatCompletion({
+          model: 'large',
+          messages: [
+            { role: 'system', content: PLAN_CHAPTER_SYSTEM_PROMPT },
+            { role: 'user', content: userPrompt }
+          ],
+          temperature: config.generation?.temperaturePlan || 0.6,
+          workflow: 'PLAN_CHAPTER'
         });
+
+        planSpinner.succeed(`Revised Chapter ${chapterNum} plan.`);
+        if (groqClient?.quotaManager) {
+          groqClient.quotaManager.recordGenerationEnd();
+        }
+      } catch (err) {
+        planSpinner.fail(`Failed to generate plan: ${err.message}`);
+        return;
       }
 
-      finalPlan = await groqClient.chatCompletion({
-        model: 'large',
-        messages: [
-          { role: 'system', content: PLAN_CHAPTER_SYSTEM_PROMPT },
-          { role: 'user', content: userPrompt }
-        ],
-        temperature: config.generation?.temperaturePlan || 0.6
+      console.log('\n' + chalk.bold.magenta(`--- Chapter ${chapterNum} Plan Preview ---`));
+      printMarkdown(finalPlan);
+
+      const validation = validatePlanFormat(finalPlan);
+      if (!validation.valid) {
+        console.log(chalk.yellow(`\nWarning: Could not detect standard "### Beat N:" headings. Please review or edit.`));
+      } else {
+        console.log(chalk.dim(`Detected ${validation.beatCount} structured beats.\n`));
+      }
+
+      const review = await promptReviewWorkflow({
+        draftContent: finalPlan,
+        itemLabel: `Chapter ${chapterNum} Plan`,
+        allowPause: false,
+        preferredEditor: config.editor,
+        quotaManager: groqClient?.quotaManager,
+        config,
+        model: config.models?.large || 'openai/gpt-oss-120b'
       });
 
-      planSpinner.succeed(
-        isEditingFullPlan
-          ? `Revised Chapter ${chapterNum} plan.`
-          : `Generated Chapter ${chapterNum} plan.`
-      );
-
-      if (groqClient?.quotaManager) {
-        groqClient.quotaManager.recordGenerationEnd();
+      if (review.action === 'accept') {
+        finalPlan = review.content;
+        accepted = true;
+      } else if (review.action === 'retry') {
+        currentFeedback = review.feedback || 'Please refine beat pacing and dramatic turns.';
       }
-
-    } catch (err) {
-      planSpinner.fail(`Failed to generate plan: ${err.message}`);
-      return;
-    }
-
-    console.log('\n' + chalk.bold.magenta(`--- Chapter ${chapterNum} Plan Preview ---`));
-    printMarkdown(finalPlan);
-
-    const validation = validatePlanFormat(finalPlan);
-    if (!validation.valid) {
-      console.log(chalk.yellow(`\nWarning: Could not detect standard "### Beat N:" headings. Please review or edit.`));
-    } else {
-      console.log(chalk.dim(`Detected ${validation.beatCount} structured beats.\n`));
-    }
-
-    const review = await promptReviewWorkflow({
-      draftContent: finalPlan,
-      itemLabel: `Chapter ${chapterNum} Plan`,
-      allowPause: false,
-      preferredEditor: config.editor,
-      quotaManager: groqClient?.quotaManager,
-      config,
-      model: config.models?.large || 'openai/gpt-oss-120b'
-    });
-
-    if (review.action === 'accept') {
-      finalPlan = review.content;
-      accepted = true;
-    } else if (review.action === 'retry') {
-      currentFeedback = review.feedback || 'Please refine beat pacing and dramatic turns.';
     }
   }
 
@@ -659,6 +941,26 @@ Generate the complete Chapter ${chapterNum} plan using the strict Beat schema.`;
   }
   await fs.writeFile(planFile, finalPlan, 'utf8');
   await setActiveBeat(chapterNum, 1, cwd);
+
+  // Condense chapter plan and beats into .condensed/chapters/chapter-XX/plan.md
+  const finalBeats = parseBeatsFromPlan(finalPlan);
+  const condenseSpinner = createSpinner(`Syncing all ${finalBeats.length} beats into .condensed/chapters/chapter-${padded}/plan.md...`).start();
+  try {
+    for (const b of finalBeats) {
+      await saveCondensedBeatPlan({
+        chapterNum,
+        beatNum: b.num,
+        beatTitle: b.title,
+        planText: b.rawBlock,
+        groqClient,
+        cwd,
+        config
+      });
+    }
+    condenseSpinner.succeed(`All ${finalBeats.length} beats condensed into .condensed/chapters/chapter-${padded}/plan.md`);
+  } catch (err) {
+    condenseSpinner.fail(`Failed to sync condensed beats: ${err.message}`);
+  }
 
   console.log(chalk.green(`\nSaved plan to project/chapter-${padded}/plan.md`));
   console.log(chalk.cyan(`Active chapter set to ${chapterNum}, beat 1. Ready to write with: /write ${chapterNum}`));

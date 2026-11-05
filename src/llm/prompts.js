@@ -1,3 +1,11 @@
+export function buildStoryBibleContext(chunks = []) {
+  if (!chunks || chunks.length === 0) return '';
+  const formatted = chunks
+    .map((c) => `[Source: ${c.source_path || 'Canon'} - Section: ${c.section_title || 'General'}]\n${c.text || ''}`)
+    .join('\n\n---\n\n');
+  return `<story_bible_lore>\n${formatted}\n</story_bible_lore>`;
+}
+
 export function buildHierarchyContext({
   instructions = '',
   tier1Chunks = [],
@@ -23,15 +31,8 @@ export function buildHierarchyContext({
     tier3Chunks.length > 0 ? `### Archived Brainstorming Notes:\n${formatChunks(tier3Chunks)}` : ''
   ].filter(Boolean).join('\n\n') || '(None available)';
 
-  return `<system_instructions>
-${instructions.trim()}
-</system_instructions>
-
-<hierarchy_of_truth_rules>
-You must strictly obey the following source hierarchy when answering or writing:
-1. TIER 1 (ABSOLUTE CANON - STORY BIBLE): Facts inside <story_bible_canon> are absolute law. Never contradict them.
-2. TIER 2 (ESTABLISHED MANUSCRIPT - PAST CHAPTERS): Events inside <past_chapters> have already occurred in the story. Maintain strict continuity with them unless overridden by Tier 1.
-3. TIER 3 (PAST CONVERSATIONS): Notes inside <past_conversations> represent earlier brainstorming. Ignore them if they conflict with Tier 1 or Tier 2.
+  return `${instructions ? `<system_instructions>\n${instructions.trim()}\n</system_instructions>\n\n` : ''}<hierarchy_of_truth_rules>
+Source Hierarchy: Story Bible (Absolute Canon) > Past Chapters (Manuscript) > Past Conversations (Brainstorming Notes)
 </hierarchy_of_truth_rules>
 
 <story_bible_canon>
@@ -81,6 +82,71 @@ Document Requirements:
 
 Ensure content is rich, literary, consistent across all four files, and written exclusively in readable paragraphs without any tables.`;
 
+// Sequential /init prompts (Requirement 8)
+export const INIT_OVERVIEW_SYSTEM_PROMPT = `You are an expert novelist and story architect.
+The author will provide a project title, writing style preferences, and a "Story in a nutshell" synopsis.
+Your task is to synthesize this synopsis into a comprehensive, foundational Story Bible document: "plot-overview.md".
+
+CRITICAL FORMATTING & STRUCTURE RULES (NO TABLES):
+- Structure strictly in cohesive narrative PARAGRAPHS under clean Markdown headers (#, ##, ###).
+- NO TABLES, column matrices, or grid layouts. Markdown tables are strictly prohibited.
+- Write in full, expressive paragraphs under headings:
+  # Plot Overview & Narrative Architecture
+  ## 1. Core Premise & Narrative Hook
+  ## 2. Central Conflict & Stakes
+  ## 3. High-Level Act Structure (Act I, Act II, Act III / Major Turns)
+  ## 4. Thematic Motifs & Core Resonance
+- Embody the author's writing style preferences and project title throughout.
+- Output ONLY the complete Markdown content for story-bible/plot-overview.md. Do not include conversational preamble.`;
+
+export const INIT_CHARACTERS_SYSTEM_PROMPT = `You are an expert novelist and character designer.
+The author will provide the project title, writing style, synopsis, and a condensed overview of the narrative arc.
+Your task is to generate the foundational Story Bible document: "characters.md".
+
+CRITICAL FORMATTING & STRUCTURE RULES (NO TABLES):
+- Structure strictly in cohesive narrative PARAGRAPHS under clean Markdown headers (#, ##, ###).
+- NO TABLES, column matrices, or grid layouts.
+- Detail Main Characters (Protagonist, Antagonist) and Key Supporting Characters.
+- For each character include: Name, Role/Archetype, Physical Appearance, Core Motivations, Internal Conflict, Distinct Voice/Cadence, and Relationships.
+- Write each character's profile using well-structured paragraphs.
+- Output ONLY the complete Markdown content for story-bible/characters.md. Do not include conversational preamble.`;
+
+export const INIT_LOCATIONS_SYSTEM_PROMPT = `You are an expert world-builder and atmospheric setting designer.
+The author will provide the project title, writing style, synopsis, and condensed narrative context.
+Your task is to generate the foundational Story Bible document: "locations.md".
+
+CRITICAL FORMATTING & STRUCTURE RULES (NO TABLES):
+- Structure strictly in cohesive narrative PARAGRAPHS under clean Markdown headers (#, ##, ###).
+- NO TABLES, column matrices, or grid layouts.
+- Detail primary settings and key story locations.
+- For each location include: Atmosphere, tangible sensory specifics (lighting, sound, textures, scents), thematic significance, and key landmarks.
+- Output ONLY the complete Markdown content for story-bible/locations.md. Do not include conversational preamble.`;
+
+export const INIT_WORLD_LORE_SYSTEM_PROMPT = `You are an expert world-builder and lore archivist.
+The author will provide the project title, writing style, synopsis, and condensed narrative context.
+Your task is to generate the foundational Story Bible document: "world-and-lore.md".
+
+CRITICAL FORMATTING & STRUCTURE RULES (NO TABLES):
+- Structure strictly in cohesive narrative PARAGRAPHS under clean Markdown headers (#, ##, ###).
+- NO TABLES, column matrices, or grid layouts.
+- Detail setting rules, era, social structure, magic/technology systems, cultural taboos, historical timeline and canon constraints in rich prose paragraphs.
+- Output ONLY the complete Markdown content for story-bible/world-and-lore.md. Do not include conversational preamble.`;
+
+export const PLAN_CHAPTER_HEADER_SYSTEM_PROMPT = `You are a master story architect.
+Your task is to plan the foundation of a specific chapter for the novel: its title, canonical summary, and chapter-level writing instructions.
+You must adhere strictly to the Story Bible canon, global style, and story continuity.
+
+CRITICAL FORMATTING & STRUCTURE RULES (NO TABLES):
+- Output ONLY the following markdown format:
+
+# Chapter [N]: [Chapter Title]
+
+## Chapter Summary
+[A comprehensive 1-to-2 paragraph overview detailing the chapter's narrative arc, pacing, emotional progression, key decisions, and dramatic shift.]
+
+## Chapter Instructions
+[Short and to the point chapter-level writing instructions: tone, pacing, tension, sensory priorities, and emotional distance for this chapter. Keep under 50 words.]`;
+
 export const PLAN_CHAPTER_SYSTEM_PROMPT = `You are a master story architect. Your task is to plan a specific chapter for the novel.
 You must adhere strictly to the Hierarchy of Truth, the global instructions, the Story Bible canon, and preceding chapter summaries.
 
@@ -96,6 +162,9 @@ EXACT OUTPUT SCHEMA:
 ## Chapter Summary
 [A comprehensive 1-to-2 paragraph overview detailing the chapter's narrative arc, pacing, emotional progression, and dramatic shift.]
 
+## Chapter Instructions
+[Short and to the point chapter-level writing instructions: tone, pacing, tension, sensory priorities, and emotional distance for this chapter. Keep under 50 words.]
+
 ## Beats
 
 ### Beat 1: [Short Beat Title]
@@ -103,12 +172,14 @@ EXACT OUTPUT SCHEMA:
 - **Location:** [Location name matching Story Bible]
 - **Action:** [A rich narrative paragraph describing in full detail what happens in this beat, character interactions, sensory events, and internal/external tension.]
 - **Goal/Hook:** [A narrative paragraph describing how this beat resolves its immediate beat goal, leaves unresolved tension, and transitions smoothly into the next beat.]
+- **Instructions:** [Short and to the point beat-level writing instructions for this specific scene.]
 
 ### Beat 2: [Short Beat Title]
 - **Characters:** [...]
 - **Location:** [...]
 - **Action:** [A rich narrative paragraph...]
 - **Goal/Hook:** [A narrative paragraph...]
+- **Instructions:** [Short and to the point beat-level writing instructions...]
 
 (Include between 3 to 6 beats per chapter depending on chapter scope. Ensure all Action and Goal/Hook entries are thorough paragraphs, never tables or terse fragments.)`;
 
@@ -122,7 +193,41 @@ CRITICAL FORMATTING & STRUCTURE RULES (NO TABLES):
 - **Location:** [Location name matching Story Bible]
 - **Action:** [A rich narrative paragraph describing in full detail what happens in this beat, character interactions, sensory events, and internal/external tension.]
 - **Goal/Hook:** [A narrative paragraph describing how this beat resolves its immediate beat goal, leaves unresolved tension, and transitions smoothly into the next beat.]
+- **Instructions:** [Short and to the point beat-level writing instructions for this specific scene.]
 - Output ONLY the single beat block starting with "### Beat [N]:". Do not include extra headings, document summaries, or conversational preamble.`;
+
+// Condensing & Summarizing prompts (Requirements 4, 5, 6)
+export const CONDENSE_BEAT_PLAN_SYSTEM_PROMPT = `You are a concise fiction editor.
+Your task is to condense a chapter beat plan into an ultra-sharp 1-to-2 sentence summary strictly under 35 words.
+Retain character names, key action, and the dramatic hook or outcome.
+Output format:
+Beat [N] ([Title]): [1-2 sentences capturing the planned action and transition strictly under 35 words.]`;
+
+export const CONDENSE_BEAT_SYSTEM_PROMPT = CONDENSE_BEAT_PLAN_SYSTEM_PROMPT;
+
+export const CONDENSE_BEAT_PROSE_SYSTEM_PROMPT = `You are a concise continuity fiction editor.
+Your task is to condense the narrative prose of a single novel beat into an ultra-sharp 1-to-2 sentence summary strictly under 40 words.
+Capture what actually transpired: key physical actions, character decisions or dialogue outcomes, and the resulting end-state.
+Output format:
+Beat [N] ([Title]): [1-2 sentences capturing what actually occurred in this scene under 40 words.]`;
+
+export const CONDENSE_PLAN_SYSTEM_PROMPT = `You are a concise fiction editor.
+Your task is to condense a chapter plan into a compact, token-efficient outline under 120 words.
+Include:
+- 1-sentence chapter objective
+- 1-sentence chapter writing instruction
+- 1-line bullet pointer for each beat (Beat N: core event)
+Output ONLY the condensed plan without preamble.`;
+
+export const CONDENSE_PROSE_SYSTEM_PROMPT = `You are a continuity editor.
+Your task is to condense the provided chapter prose into a chronological sequence of concise scene progression pointers (~100 words).
+Focus on physical movement, revelations made, emotional shifts, and final character positions.
+Output ONLY the concise pointers without conversational preamble.`;
+
+export const UPDATE_STORY_SO_FAR_SYSTEM_PROMPT = `You are a continuity archivist for a novel.
+Your task is to extract 2 to 3 compact, token-efficient human-readable bullet pointers from a completed chapter summary.
+Focus strictly on major canonical events, character decisions, secrets discovered, and physical end-states.
+Keep the entire output strictly under 50 words. Do not include markdown headers or commentary.`;
 
 export const WRITE_BEAT_SYSTEM_PROMPT = `You are an acclaimed novelist writing prose for a novel chapter.
 You are writing ONE BEAT at a time.
@@ -201,4 +306,3 @@ Respond with a JSON object matching this exact schema:
   ]
 }
 If there are no genuine continuity errors, return { "passed": true, "severity": "none", "issues": [] }. Do not nitpick subjective style choices.`;
-

@@ -44,7 +44,7 @@ export function buildInstructionsContent({ projectTitle = 'Untitled Novel', writ
     if (writingStyle && writingStyle.trim() !== enhancedWritingStyle.trim()) {
       content += `### Author Stated Preferences:\n${writingStyle.trim()}\n\n`;
     }
-    content += `### AI-Enhanced Literary Prose Specification:\n${enhancedWritingStyle.trim()}\n\n`;
+    content += `### AI-Enhanced Literary Prose Specification (Global Stylized Instructions < 100 words):\n${enhancedWritingStyle.trim()}\n\n`;
   } else if (writingStyle) {
     content += `## Author Writing Style Preferences & Tone\n${writingStyle}\n\n`;
   }
@@ -153,6 +153,8 @@ export async function ensureProjectDirectories(cwd = process.cwd(), config = nul
     path.join(cwd, CONFIG_DIR),
     path.join(cwd, CONFIG_DIR, 'index'),
     path.join(cwd, CONFIG_DIR, 'backups'),
+    path.join(cwd, '.condensed'),
+    path.join(cwd, '.condensed', 'chapters'),
     path.join(cwd, 'story-bible'),
     path.join(cwd, 'conversations', 'archive'),
     path.join(cwd, 'project'),
@@ -197,7 +199,7 @@ export async function enhanceWritingStyleWithAi({
   projectTitle = 'Untitled Novel',
   writingStyle = '',
   groqApiKey = '',
-  model = 'openai/gpt-oss-120b'
+  model = 'openai/gpt-oss-20b'
 } = {}) {
   const trimmed = (writingStyle || '').trim();
   if (!trimmed || !groqApiKey) {
@@ -208,33 +210,35 @@ export async function enhanceWritingStyleWithAi({
     const { Groq } = await import('groq-sdk');
     const client = new Groq({ apiKey: groqApiKey });
 
-    const systemPrompt = `You are an elite literary editor, prose stylist, and novelist consultant.
+    const systemPrompt = `You are an elite literary prose editor and novelist consultant.
 The author is writing a novel titled "${projectTitle}".
-The author has provided their core writing style preferences. Your job is to analyze and expand these preferences into an actionable, comprehensive, and high-impact literary prose guide.
+The author has provided writing style preferences. Your task is to stylize and sharpen these preferences into punchy, high-impact global writing instructions strictly UNDER 100 WORDS.
 
-Your guide MUST be formatted under clear Markdown section headings (NO TABLES) with rich, focused instructions:
-1. Point of View & Narrative Distance: POV mechanics (e.g. deep third-person limited), interiority access, sensory filter.
-2. Prose Rhythm, Cadence & Syntax: Sentence length variance, clause structure, micro-pacing for action vs contemplative moments.
-3. Tone, Mood & Atmospheric Texture: Sensory priorities (light, texture, temperature, smell), emotional restraint vs raw expression.
-4. Vocabulary, Diction & Figurative Language: Register, thematic motifs, metaphor style, avoiding purple prose and clichés.
-5. Dialogue Dynamics: Character voice distinctiveness, subtext, cadence, and dialogue tagging rules.
-
-Output ONLY the enhanced style guide as markdown paragraphs under headings. Do not include introductory conversational pleasantries or meta commentary.`;
+Rules:
+1. Cover POV, tense, prose cadence, atmospheric tone, and sensory grounding.
+2. Keep the entire response strictly UNDER 100 WORDS.
+3. Be clear, direct, and actionable for an AI story-writing agent.
+4. Output ONLY the stylized global instructions text. Do not include titles, markdown headings, bullet headers, pleasantries, or preamble.`;
 
     const response = await client.chat.completions.create({
-      model: model || 'openai/gpt-oss-120b',
+      model: model || 'openai/gpt-oss-20b',
       messages: [
         { role: 'system', content: systemPrompt },
         {
           role: 'user',
-          content: `Author's Writing Style Preferences for "${projectTitle}":\n"${trimmed}"\n\nEnhance this into a concrete, professional literary prose specification.`
+          content: `Author's Core Writing Style Preferences for "${projectTitle}":\n"${trimmed}"\n\nStylize into actionable global writing instructions strictly under 100 words.`
         }
       ],
-      temperature: 0.5,
-      max_tokens: 1500
+      temperature: 0.4,
+      max_tokens: 250
     });
 
-    const enhanced = response.choices[0]?.message?.content?.trim();
+    let enhanced = response.choices[0]?.message?.content?.trim() || trimmed;
+    // Enforce under 100 words guardrail
+    const words = enhanced.split(/\s+/);
+    if (words.length > 100) {
+      enhanced = words.slice(0, 100).join(' ');
+    }
     return enhanced || trimmed;
   } catch (err) {
     // If enhancement fails (e.g. offline or network issue), fallback gracefully to original
@@ -341,7 +345,7 @@ export async function runOnboardingWizard(cwd = process.cwd()) {
         projectTitle: projectTitle.trim() || 'Untitled Novel',
         writingStyle: finalStyle,
         groqApiKey: finalGroqKey.trim(),
-        model: largeModel.trim() || defaults.models.large
+        model: smallModel.trim() || defaults.models.small
       });
       spinner.succeed('AI-enhanced writing style guide generated.');
     } catch {

@@ -233,20 +233,24 @@ test('Requirement 4: Writing a chapter already completed enters edit mode and al
     };
 
     // Auto-accept by simulating stdin keypress 'a'
-    setTimeout(() => {
+    const timer = setInterval(() => {
       process.stdin.emit('keypress', 'a', { sequence: 'a', name: 'a' });
     }, 50);
 
-    // Run write chapter for beat 1 on completed chapter (targeted beat revision)
-    await runWriteChapterWorkflow({
-      chapterArg: '1 1 Make it more atmospheric',
-      cwd: tmpDir,
-      groqClient: mockGroq,
-      vectorStore: mockVectorStore,
-      embedder: mockEmbedder,
-      reranker: mockReranker,
-      config: { writingStyle: 'Literary Fantasy', editor: 'none', generation: { enableContinuityCritic: false } }
-    });
+    try {
+      // Run write chapter for beat 1 on completed chapter (targeted beat revision)
+      await runWriteChapterWorkflow({
+        chapterArg: '1 1 Make it more atmospheric',
+        cwd: tmpDir,
+        groqClient: mockGroq,
+        vectorStore: mockVectorStore,
+        embedder: mockEmbedder,
+        reranker: mockReranker,
+        config: { writingStyle: 'Literary Fantasy', editor: 'none', generation: { enableContinuityCritic: false } }
+      });
+    } finally {
+      clearInterval(timer);
+    }
 
     // Check that previous draft of beat 1 was included in the revision prompt!
     assert.ok(invokedPrompt.includes('### PREVIOUS DRAFT OF BEAT 1 (TO BE REVISED & IMPROVED):'), 'Prompt must contain previous draft section');
@@ -408,9 +412,11 @@ The fortress prepares for the winter siege.
 
     let invokedPrompt = '';
     const fakeGroq = {
-      chatCompletion: async ({ messages }) => {
-        const userMsg = messages.find((m) => m.role === 'user');
-        invokedPrompt = userMsg ? userMsg.content : '';
+      chatCompletion: async ({ messages, workflow }) => {
+        if (!workflow || !workflow.startsWith('CONDENSE')) {
+          const userMsg = messages.find((m) => m.role === 'user');
+          invokedPrompt = userMsg ? userMsg.content : '';
+        }
         return `### Beat 1: Parapet Vigil
 - **Characters:** Jonathan, Rowan
 - **Location:** North Parapet
@@ -434,21 +440,25 @@ The fortress prepares for the winter siege.
     };
 
     // Auto-accept review prompt
-    setTimeout(() => {
+    const timer = setInterval(() => {
       process.stdin.emit('keypress', 'a', { sequence: 'a', name: 'a' });
     }, 50);
 
-    // Run /plan 1 1 with edit guidance
-    await runPlanChapterWorkflow({
-      chapterArg: '1 1 Add Rowan to the scene and sharpen the alarm bell',
-      cwd: tmpDir,
-      groqClient: fakeGroq,
-      vectorStore: mockVectorStore,
-      embedder: mockEmbedder,
-      reranker: mockReranker,
-      conversationMgr: { getRollingSummary: () => '' },
-      config: { writingStyle: 'Literary Fantasy', editor: 'none' }
-    });
+    try {
+      // Run /plan 1 1 with edit guidance
+      await runPlanChapterWorkflow({
+        chapterArg: '1 1 Add Rowan to the scene and sharpen the alarm bell',
+        cwd: tmpDir,
+        groqClient: fakeGroq,
+        vectorStore: mockVectorStore,
+        embedder: mockEmbedder,
+        reranker: mockReranker,
+        conversationMgr: { getRollingSummary: () => '' },
+        config: { writingStyle: 'Literary Fantasy', editor: 'none' }
+      });
+    } finally {
+      clearInterval(timer);
+    }
 
     // Check that existing beat draft was passed into LLM prompt
     assert.ok(invokedPrompt.includes('<current_beat_draft_to_revise>'), 'Prompt must include current beat draft section');
@@ -491,9 +501,11 @@ The castle prepares for winter.
 
     let invokedPrompt = '';
     const fakeGroq = {
-      chatCompletion: async ({ messages }) => {
-        const userMsg = messages.find((m) => m.role === 'user');
-        invokedPrompt = userMsg ? userMsg.content : '';
+      chatCompletion: async ({ messages, workflow }) => {
+        if (!workflow || !workflow.startsWith('CONDENSE')) {
+          const userMsg = messages.find((m) => m.role === 'user');
+          invokedPrompt = userMsg ? userMsg.content : '';
+        }
         return `# Chapter 1: The Bitter Frost
 
 ## Chapter Summary
@@ -524,21 +536,25 @@ The castle prepares for an impending siege as winter sets in.
     };
 
     // Auto-accept review prompt
-    setTimeout(() => {
+    const timer = setInterval(() => {
       process.stdin.emit('keypress', 'a', { sequence: 'a', name: 'a' });
     }, 50);
 
-    // Run /plan 1 with full chapter revision guidance
-    await runPlanChapterWorkflow({
-      chapterArg: '1 Deepen tension and introduce Captain Drake early',
-      cwd: tmpDir,
-      groqClient: fakeGroq,
-      vectorStore: mockVectorStore,
-      embedder: mockEmbedder,
-      reranker: mockReranker,
-      conversationMgr: { getRollingSummary: () => '' },
-      config: { writingStyle: 'Epic Fantasy', editor: 'none' }
-    });
+    try {
+      // Run /plan 1 with full chapter revision guidance
+      await runPlanChapterWorkflow({
+        chapterArg: '1 Deepen tension and introduce Captain Drake early',
+        cwd: tmpDir,
+        groqClient: fakeGroq,
+        vectorStore: mockVectorStore,
+        embedder: mockEmbedder,
+        reranker: mockReranker,
+        conversationMgr: { getRollingSummary: () => '' },
+        config: { writingStyle: 'Epic Fantasy', editor: 'none' }
+      });
+    } finally {
+      clearInterval(timer);
+    }
 
     // Check prompt contains the existing chapter plan for editing
     assert.ok(invokedPrompt.includes('### EXISTING CHAPTER 1 PLAN (FOR REVISION & IMPROVEMENT):'));
@@ -606,21 +622,25 @@ Winter begins.
     };
 
     // Auto-accept review prompt
-    setTimeout(() => {
+    const timer = setInterval(() => {
       process.stdin.emit('keypress', 'a', { sequence: 'a', name: 'a' });
     }, 50);
 
-    // Run /plan 1 add
-    await runPlanChapterWorkflow({
-      chapterArg: '1 add A mysterious rider arrives',
-      cwd: tmpDir,
-      groqClient: fakeGroq,
-      vectorStore: mockVectorStore,
-      embedder: mockEmbedder,
-      reranker: mockReranker,
-      conversationMgr: { getRollingSummary: () => '' },
-      config: { writingStyle: 'Epic Fantasy', editor: 'none' }
-    });
+    try {
+      // Run /plan 1 add
+      await runPlanChapterWorkflow({
+        chapterArg: '1 add A mysterious rider arrives',
+        cwd: tmpDir,
+        groqClient: fakeGroq,
+        vectorStore: mockVectorStore,
+        embedder: mockEmbedder,
+        reranker: mockReranker,
+        conversationMgr: { getRollingSummary: () => '' },
+        config: { writingStyle: 'Epic Fantasy', editor: 'none' }
+      });
+    } finally {
+      clearInterval(timer);
+    }
 
     assert.equal(targetBeatNumberAssigned, 2, 'Should target Beat 2 when Beat 1 exists');
 

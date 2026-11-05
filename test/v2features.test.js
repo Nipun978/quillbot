@@ -139,25 +139,29 @@ A tense evening in Havenbrook as Jonathan and Rowan plan their escape.
 
     // Auto-accept by simulating stdin keypress 'a'
     const origHotkeySelect = hotkeySelect;
-    setTimeout(() => {
+    const acceptTimer = setInterval(() => {
       process.stdin.emit('keypress', 'a', { sequence: 'a', name: 'a' });
-    }, 40);
+    }, 50);
 
-    await runWriteChapterWorkflow({
-      chapterArg: '1 1', // rewrite Chapter 1 Beat 1
-      cwd: tmpDir,
-      groqClient: fakeGroq,
-      vectorStore: {
-        hybridSearch: async () => [],
-        deleteBySourcePath: async () => {},
-        addChunks: async () => {},
-        rebuildFtsIndex: async () => {}
-      },
-      embedder: { embedQuery: async () => [], embedTexts: async () => [] },
-      reranker: { rerank: async () => [] },
-      conversationMgr: { getRollingSummary: () => '' },
-      config: { generation: { enableContinuityCritic: false, continuityTailWords: 350 } }
-    });
+    try {
+      await runWriteChapterWorkflow({
+        chapterArg: '1 1', // rewrite Chapter 1 Beat 1
+        cwd: tmpDir,
+        groqClient: fakeGroq,
+        vectorStore: {
+          hybridSearch: async () => [],
+          deleteBySourcePath: async () => {},
+          addChunks: async () => {},
+          rebuildFtsIndex: async () => {}
+        },
+        embedder: { embedQuery: async () => [], embedTexts: async () => [] },
+        reranker: { rerank: async () => [] },
+        conversationMgr: { getRollingSummary: () => '' },
+        config: { generation: { enableContinuityCritic: false, continuityTailWords: 350 } }
+      });
+    } finally {
+      clearInterval(acceptTimer);
+    }
 
     assert.equal(generatedCount, 1);
 
