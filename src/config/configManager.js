@@ -195,6 +195,46 @@ export async function updateInstructionsFile(cwd = process.cwd(), { projectTitle
   return content;
 }
 
+export function truncateAtSentenceBoundary(text = '', maxWords = 100) {
+  const trimmed = (text || '').trim();
+  if (!trimmed) return '';
+
+  const words = trimmed.split(/\s+/).filter(Boolean);
+  if (words.length <= maxWords) {
+    return trimmed;
+  }
+
+  // Split into sentences preserving punctuation (. ! ?)
+  const sentences = trimmed.match(/[^.!?]+[.!?]+(?:\s+|$)|[^.!?]+$/g) || [trimmed];
+  const accumulated = [];
+  let currentWordCount = 0;
+
+  for (const sentence of sentences) {
+    const sTrimmed = sentence.trim();
+    if (!sTrimmed) continue;
+    const sWords = sTrimmed.split(/\s+/).filter(Boolean).length;
+    if (currentWordCount + sWords <= maxWords) {
+      accumulated.push(sTrimmed);
+      currentWordCount += sWords;
+    } else {
+      break;
+    }
+  }
+
+  if (accumulated.length > 0) {
+    return accumulated.join(' ');
+  }
+
+  // Fallback: If even the first sentence is over maxWords, split cleanly at maxWords and end with period
+  const targetWords = words.slice(0, maxWords);
+  const truncatedText = targetWords.join(' ');
+  const lastClause = truncatedText.match(/^(.*[,;—–-])\s+[^\s,;—–-]+$/);
+  if (lastClause && lastClause[1].length > truncatedText.length * 0.6) {
+    return lastClause[1].replace(/[,;—–-]+$/, '').trim() + '.';
+  }
+  return truncatedText.replace(/[^\w\s]+$/, '').trim() + '.';
+}
+
 export async function enhanceWritingStyleWithAi({
   projectTitle = 'Untitled Novel',
   writingStyle = '',
@@ -234,11 +274,8 @@ Rules:
     });
 
     let enhanced = response.choices[0]?.message?.content?.trim() || trimmed;
-    // Enforce under 100 words guardrail
-    const words = enhanced.split(/\s+/);
-    if (words.length > 100) {
-      enhanced = words.slice(0, 100).join(' ');
-    }
+    // Enforce under 100 words guardrail cleanly at sentence boundary
+    enhanced = truncateAtSentenceBoundary(enhanced, 100);
     return enhanced || trimmed;
   } catch (err) {
     // If enhancement fails (e.g. offline or network issue), fallback gracefully to original

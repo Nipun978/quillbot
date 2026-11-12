@@ -3,18 +3,230 @@ import path from 'node:path';
 import { input, select } from '@inquirer/prompts';
 import chalk from 'chalk';
 import {
-  QUERY_REWRITE_SYSTEM_PROMPT,
+  BIBLE_QUERY_IMPROVISE_SYSTEM_PROMPT,
+  GENERAL_QUERY_IMPROVISE_SYSTEM_PROMPT,
   BIBLE_SAVE_EXTRACT_SYSTEM_PROMPT,
   CREATE_BIBLE_FILE_SYSTEM_PROMPT,
   EDIT_BIBLE_FILE_SYSTEM_PROMPT,
+  buildStoryBibleContext,
   buildHierarchyContext
 } from '../llm/prompts.js';
 import { loadInstructions } from '../config/configManager.js';
 import { createBackup } from '../config/backupManager.js';
-import { createSpinner, printMarkdown } from '../ui/renderer.js';
+import { createSpinner, printMarkdown, createReadableStreamPrinter } from '../ui/renderer.js';
 import { promptReviewWorkflow, openInEditor } from '../ui/reviewPrompt.js';
 import { syncAllFiles } from '../rag/fileSync.js';
 import { ensureStdinRaw } from '../ui/ttyManager.js';
+
+const READABLE_RESPONSE_RULES = `
+Formatting & Readability Rules:
+- Write in a helpful, clear, easy-to-read conversational style.
+- Do NOT use raw markdown syntax: no # headings, no ** or __ bold/italic markers, no backticks, and no markdown tables.
+- Use short paragraphs, plain section labels (for example, "Key Details:" or "Next Steps:"), and simple "- " bullet points with blank lines between sections.`;
+
+/**
+ * Shared Hybrid RAG consultation pipeline supporting two scopes:
+ * - 'bible': Queries strictly Story Bible files (story-bible/**, Tier 1)
+ * - 'all':   Queries all project sources (Story Bible, chapters, .condensed files, and archived conversations)
+ */
+async function runRagConsultation({
+  query,
+  scope = 'all',
+  cwd = process.cwd(),
+  groqClient,
+  vectorStore,
+  embedder,
+  reranker,
+  conversationMgr,
+  config
+}) {
+  const cleanQuery = (query || '').trim();
+  if (!cleanQuery) return;
+
+  const isBibleScope = scope === 'bible';
+  const recentTurns = conversationMgr?.getRecentTurns ? conversationMgr.getRecentTurns(4) : [];
+  const rollingSummary = conversationMgr?.getRollingSummary ? conversationMgr.getRollingSummary() : '';
+
+  // 1. Always improvise the query first using the 20B (small) model
+  let improvisedQuery = cleanQuery;
+  const improviseSpinner = createSpinner('Improvising search query with 20B model...').start();
+  try {
+    const turnsText = recentTurns.length > 0
+      ? recentTurns.map((t) => `${t.role}: ${t.content}`).join('\n')
+      : '(None — standalone question)';
+
+    const improvisePrompt = `Conversation History:\n${turnsText}\n\nUser Question:\n${cleanQuery}\n\nImprovised search query:`;
+
+    const rewritten = await groqClient.chatCompletion({
+      model: 'small',
+      messages: [
+        {
+          role: 'system',
+          content: isBibleScope ? BIBLE_QUERY_IMPROVISE_SYSTEM_PROMPT : GENERAL_QUERY_IMPROVISE_SYSTEM_PROMPT
+        },
+        { role: 'user', content: improvisePrompt }
+      ],
+      temperature: 0.1,
+      sessionId: conversationMgr?.current?.id || 'current',
+      workflow: isBibleScope ? 'IMPROVISE_BIBLE_QUERY' : 'IMPROVISE_GENERAL_QUERY'
+    });
+
+    if (rewritten && rewritten.trim()) {
+      improvisedQuery = rewritten.trim();
+    }
+    improviseSpinner.succeed(`Search query: "${improvisedQuery}"`);
+  } catch {
+    improviseSpinner.stop();
+  }
+
+  // 2. Hybrid Retrieval (Vector + BM25 + RRF) + Cross-Encoder Reranking
+  const searchLabel = isBibleScope
+    ? 'Searching Story Bible files with Hybrid RAG...'
+    : 'Searching all project sources (Story Bible, chapters, condensed files, notes) with Hybrid RAG...';
+  const searchSpinner = createSpinner(searchLabel).start();
+
+  let rerankedChunks = [];
+  try {
+    const queryVector = await embedder.embedQuery(improvisedQuery);
+    const searchOpts = {
+      queryText: improvisedQuery,
+      queryVector,
+      vectorTopK: config?.rag?.vectorTopK || 15,
+      bm25TopK: config?.rag?.bm25TopK || 15,
+      rrfK: config?.rag?.rrfK || 60
+    };
+
+    if (isBibleScope) {
+      searchOpts.sourceTypes = ['story-bible'];
+      searchOpts.authorityTiers = [1];
+    }
+
+    const candidates = await vectorStore.hybridSearch(searchOpts);
+    const defaultTopK = isBibleScope ? 5 : 6;
+    rerankedChunks = await reranker.rerank({
+      queryText: improvisedQuery,
+      candidates,
+      topK: config?.rag?.rerankTopK || defaultTopK
+    });
+
+    if (isBibleScope) {
+      rerankedChunks = rerankedChunks.filter(
+        (c) => c.source_type === 'story-bible' ||
+          Number(c.authority_tier) === 1 ||
+          String(c.source_path || '').startsWith('story-bible/')
+      );
+    }
+
+    const sourceDesc = isBibleScope ? 'Story Bible sources' : 'project sources';
+    searchSpinner.succeed(`Retrieved ${rerankedChunks.length} relevant ${sourceDesc}.`);
+  } catch (err) {
+    searchSpinner.fail(`Retrieval error: ${err.message}`);
+  }
+
+  // 3. Assemble Context & System Prompt
+  const instructions = await loadInstructions(cwd);
+  let systemMessage = '';
+
+  if (isBibleScope) {
+    const bibleContext = rerankedChunks.length > 0
+      ? buildStoryBibleContext(rerankedChunks)
+      : '<story_bible_lore>\n(No matching Story Bible entries found)\n</story_bible_lore>';
+
+    systemMessage = `${instructions ? `<system_instructions>\n${instructions.trim()}\n</system_instructions>\n\n` : ''}${bibleContext}${rollingSummary ? `\n\n<recent_discussion_summary>\n${rollingSummary}\n</recent_discussion_summary>` : ''}
+
+You are Quillbot, a helpful Story Bible canon assistant.
+Answer the author's question based strictly on the Story Bible files retrieved above.
+Mention the relevant Story Bible filenames naturally in plain text. If a detail is not recorded in the Story Bible yet, state that clearly and offer helpful creative suggestions consistent with existing canon.
+${READABLE_RESPONSE_RULES}`;
+  } else {
+    const tier1 = rerankedChunks.filter((c) => Number(c.authority_tier) === 1);
+    const tier2 = rerankedChunks.filter((c) => Number(c.authority_tier) === 2);
+    const tier3 = rerankedChunks.filter((c) => Number(c.authority_tier) === 3);
+
+    const hierarchyXml = buildHierarchyContext({
+      instructions,
+      tier1Chunks: tier1,
+      tier2Chunks: tier2,
+      tier3Chunks: tier3,
+      rollingSummary
+    });
+
+    systemMessage = `${hierarchyXml}
+
+You are Quillbot, a helpful novel writing assistant consulting across all project sources: Story Bible canon, chapter plans, chapter manuscripts, condensed progress files (.condensed), and archived discussion notes.
+Synthesize the most relevant facts while honoring the Hierarchy of Truth (Story Bible > Chapters & Condensed Progress > Archived Notes), and cite the exact files or chapters you draw from in plain text.
+If something hasn't been written or decided yet, say so clearly and offer practical next-step suggestions.
+${READABLE_RESPONSE_RULES}`;
+  }
+
+  // Display citations banner
+  if (rerankedChunks.length > 0) {
+    const citedFiles = [...new Set(rerankedChunks.map((c) => c.source_path))];
+    const bannerLabel = isBibleScope ? 'Referencing Story Bible files' : 'Referencing sources';
+    console.log(chalk.dim(`\n  ${bannerLabel}: [${citedFiles.join(', ')}]`));
+  }
+
+  const messages = [
+    { role: 'system', content: systemMessage },
+    ...recentTurns.map((t) => ({ role: t.role, content: t.content })),
+    { role: 'user', content: cleanQuery }
+  ];
+
+  // 4. Stream Easy-to-Read Output
+  const headerLabel = isBibleScope ? '\nQuillbot (Story Bible):\n' : '\nQuillbot:\n';
+  process.stdout.write(chalk.bold.magenta(headerLabel));
+  const printer = createReadableStreamPrinter();
+  let fullAnswer = '';
+
+  try {
+    fullAnswer = await groqClient.streamChatCompletion({
+      model: 'large',
+      messages,
+      temperature: 0.7,
+      sessionId: conversationMgr?.current?.id || 'current',
+      workflow: isBibleScope ? 'BIBLE_QUERY' : 'PROJECT_QUERY',
+      onChunk: (delta) => {
+        printer.push(delta);
+      }
+    });
+    printer.flush();
+    console.log('\n');
+  } catch (err) {
+    printer.flush();
+    console.error(chalk.red(`\nGeneration error: ${err.message}`));
+    return;
+  }
+
+  if (conversationMgr?.addTurn) {
+    await conversationMgr.addTurn('user', isBibleScope ? `/bible query ${cleanQuery}` : cleanQuery);
+    await conversationMgr.addTurn('assistant', fullAnswer);
+  }
+}
+
+export async function runGeneralQuery({
+  query,
+  cwd = process.cwd(),
+  groqClient,
+  vectorStore,
+  embedder,
+  reranker,
+  conversationMgr,
+  config
+}) {
+  const clean = (query || '').trim();
+  if (!clean) return;
+  return runRagConsultation({
+    query: clean,
+    scope: 'all',
+    cwd,
+    groqClient,
+    vectorStore,
+    embedder,
+    reranker,
+    conversationMgr,
+    config
+  });
+}
 
 export async function runBibleQuery({
   query,
@@ -35,7 +247,7 @@ export async function runBibleQuery({
     const action = await select({
       message: 'Story Bible Actions:',
       choices: [
-        { name: `🔍 ${chalk.bold.cyan('Query Lore')} — Ask a question or search Story Bible canon`, value: 'query' },
+        { name: `🔍 ${chalk.bold.cyan('Query Story Bible')} — Search & ask questions from Story Bible files`, value: 'query' },
         { name: `➕ ${chalk.bold('Create File')} — Add a new Story Bible file (e.g. magic-system.md)`, value: 'create' },
         { name: `✏️  ${chalk.bold('Edit File')} — Safely update/expand an existing Story Bible file`, value: 'edit' },
         { name: `📋 ${chalk.bold('List Files')} — View all Story Bible documents and word counts`, value: 'list' },
@@ -58,19 +270,35 @@ export async function runBibleQuery({
       return handleBibleSave({ cwd, groqClient, vectorStore, embedder, conversationMgr, config });
     }
 
-    // Otherwise query / consult
+    // Otherwise query Story Bible
     ensureStdinRaw();
     const q = await input({
-      message: 'Enter your lore query or question:'
+      message: 'Enter your Story Bible question:'
     });
     if (!q || !q.trim()) return;
     query = q.trim();
   }
 
-  const lower = query.trim().toLowerCase();
+  let effectiveQuery = query.trim();
+  const lower = effectiveQuery.toLowerCase();
+
+  // Handle "/bible query" (prompt interactively) or "/bible query <question>"
+  if (lower === 'query') {
+    ensureStdinRaw();
+    const q = await input({
+      message: 'Enter your Story Bible question:'
+    });
+    if (!q || !q.trim()) return;
+    effectiveQuery = q.trim();
+  } else if (lower.startsWith('query ')) {
+    effectiveQuery = effectiveQuery.replace(/^query\s+/i, '').trim();
+    if (!effectiveQuery) return;
+  }
+
+  const effectiveLower = effectiveQuery.toLowerCase();
 
   // Check for "/bible save"
-  if (lower === 'save') {
+  if (effectiveLower === 'save') {
     return handleBibleSave({
       cwd,
       groqClient,
@@ -82,8 +310,8 @@ export async function runBibleQuery({
   }
 
   // Check for "/bible create [filename]" or "/bible new [filename]"
-  if (lower.startsWith('create') || lower.startsWith('new')) {
-    const arg = query.trim().replace(/^(create|new)\s*/i, '').trim();
+  if (effectiveLower.startsWith('create') || effectiveLower.startsWith('new')) {
+    const arg = effectiveQuery.replace(/^(create|new)\s*/i, '').trim();
     return handleBibleCreate({
       arg,
       cwd,
@@ -95,8 +323,8 @@ export async function runBibleQuery({
   }
 
   // Check for "/bible edit [filename]"
-  if (lower.startsWith('edit')) {
-    const arg = query.trim().replace(/^edit\s*/i, '').trim();
+  if (effectiveLower.startsWith('edit')) {
+    const arg = effectiveQuery.replace(/^edit\s*/i, '').trim();
     return handleBibleEdit({
       arg,
       cwd,
@@ -108,116 +336,21 @@ export async function runBibleQuery({
   }
 
   // Check for "/bible list"
-  if (lower === 'list') {
+  if (effectiveLower === 'list') {
     return handleBibleList({ cwd });
   }
 
-  // 1. Query Rewriting with Small Model
-  const recentTurns = conversationMgr.getRecentTurns(4);
-  let rewrittenQuery = query.trim();
-
-  if (recentTurns.length > 0) {
-    const rewriteSpinner = createSpinner('Resolving context and rewriting query...').start();
-    try {
-      const turnsText = recentTurns.map((t) => `${t.role}: ${t.content}`).join('\n');
-      const rewritePrompt = `Conversation History:\n${turnsText}\n\nCurrent User Query:\n${query}\n\nRewritten search query:`;
-
-      const rewritten = await groqClient.chatCompletion({
-        model: 'small',
-        messages: [
-          { role: 'system', content: QUERY_REWRITE_SYSTEM_PROMPT },
-          { role: 'user', content: rewritePrompt }
-        ],
-        temperature: 0.1,
-        sessionId: conversationMgr.current?.id || 'current',
-        workflow: 'QUERY_REWRITE'
-      });
-
-      if (rewritten && rewritten.trim()) {
-        rewrittenQuery = rewritten.trim();
-      }
-      rewriteSpinner.succeed(`Search query: "${rewrittenQuery}"`);
-    } catch {
-      rewriteSpinner.stop();
-    }
-  }
-
-  // 2. Hybrid Retrieval + Cross-Encoder Reranking
-  const searchSpinner = createSpinner('Running Vector + BM25 hybrid search & ONNX reranking...').start();
-  let rerankedChunks = [];
-  try {
-    const queryVector = await embedder.embedQuery(rewrittenQuery);
-    const candidates = await vectorStore.hybridSearch({
-      queryText: rewrittenQuery,
-      queryVector,
-      vectorTopK: config.rag?.vectorTopK || 15,
-      bm25TopK: config.rag?.bm25TopK || 15,
-      rrfK: config.rag?.rrfK || 60
-    });
-
-    rerankedChunks = await reranker.rerank({
-      queryText: rewrittenQuery,
-      candidates,
-      topK: config.rag?.rerankTopK || 5
-    });
-
-    searchSpinner.succeed(`Retrieved ${rerankedChunks.length} top canonical sources.`);
-  } catch (err) {
-    searchSpinner.fail(`Retrieval error: ${err.message}`);
-  }
-
-  // Sort into Tiers
-  const tier1 = rerankedChunks.filter((c) => Number(c.authority_tier) === 1);
-  const tier2 = rerankedChunks.filter((c) => Number(c.authority_tier) === 2);
-  const tier3 = rerankedChunks.filter((c) => Number(c.authority_tier) === 3);
-
-  const instructions = await loadInstructions(cwd);
-  const hierarchyXml = buildHierarchyContext({
-    instructions,
-    tier1Chunks: tier1,
-    tier2Chunks: tier2,
-    tier3Chunks: tier3,
-    rollingSummary: conversationMgr.getRollingSummary()
+  return runRagConsultation({
+    query: effectiveQuery,
+    scope: 'bible',
+    cwd,
+    groqClient,
+    vectorStore,
+    embedder,
+    reranker,
+    conversationMgr,
+    config
   });
-
-  // Display citations banner
-  if (rerankedChunks.length > 0) {
-    const citedFiles = [...new Set(rerankedChunks.map((c) => c.source_path))];
-    console.log(chalk.dim(`\n  Referencing sources: [${citedFiles.join(', ')}]\n`));
-  }
-
-  // 3. Streaming Response from Large Model
-  const systemMessage = `${hierarchyXml}\n\nYou are consulting with the author about their Story Bible, plot, or lore.
-Cite exact source files when answering questions. If a detail is missing from the Story Bible, explicitly state that it has not been recorded yet and offer creative suggestions.`;
-
-  const messages = [
-    { role: 'system', content: systemMessage },
-    ...recentTurns.map((t) => ({ role: t.role, content: t.content })),
-    { role: 'user', content: query }
-  ];
-
-  process.stdout.write(chalk.bold.magenta('\nQuillbot: '));
-  let fullAnswer = '';
-
-  try {
-    fullAnswer = await groqClient.streamChatCompletion({
-      model: 'large',
-      messages,
-      temperature: 0.7,
-      sessionId: conversationMgr.current?.id || 'current',
-      workflow: 'BIBLE_CONSULTATION',
-      onChunk: (delta) => {
-        process.stdout.write(delta);
-      }
-    });
-    console.log('\n');
-  } catch (err) {
-    console.error(chalk.red(`\nGeneration error: ${err.message}`));
-    return;
-  }
-
-  await conversationMgr.addTurn('user', `/bible ${query}`);
-  await conversationMgr.addTurn('assistant', fullAnswer);
 }
 
 /**
@@ -394,9 +527,9 @@ export async function handleBibleEdit({
       itemLabel: `edited story-bible/${filename}`,
       allowPause: false,
       preferredEditor: config.editor,
-    quotaManager: groqClient?.quotaManager,
-    config,
-    model: config.models?.small || 'openai/gpt-oss-20b'
+      quotaManager: groqClient?.quotaManager,
+      config,
+      model: config.models?.small || 'openai/gpt-oss-20b'
     });
 
     if (review.action === 'accept') {
@@ -458,9 +591,9 @@ export async function handleBibleEdit({
       itemLabel: `updated story-bible/${filename}`,
       allowPause: false,
       preferredEditor: config.editor,
-    quotaManager: groqClient?.quotaManager,
-    config,
-    model: config.models?.small || 'openai/gpt-oss-20b'
+      quotaManager: groqClient?.quotaManager,
+      config,
+      model: config.models?.small || 'openai/gpt-oss-20b'
     });
 
     if (review.action === 'accept') {

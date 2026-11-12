@@ -30,7 +30,7 @@ export class CrossEncoderReranker {
     queryText,
     candidates = [],
     topK = this.topK,
-    authorityBoosts = { 1: 1.25, 2: 1.10, 3: 1.00 }
+    authorityBoosts = null
   }) {
     if (!candidates || candidates.length === 0) return [];
     if (!queryText || !queryText.trim()) {
@@ -60,8 +60,10 @@ export class CrossEncoderReranker {
         const normScore = sigmoid(rawLogit);
 
         const tier = Number(item.authority_tier) || 3;
-        const boost = authorityBoosts[tier] ?? 1.0;
-        const finalScore = normScore * boost;
+        // Soft additive tie-breaker (+0.02 for Tier 1 canon, +0.01 for Tier 2 manuscript)
+        // preserves pure cross-encoder probabilities without double-boosting multiplication
+        const tierBonus = tier === 1 ? 0.02 : (tier === 2 ? 0.01 : 0.0);
+        const finalScore = normScore + tierBonus;
 
         scored.push({
           ...item,

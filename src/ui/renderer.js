@@ -26,6 +26,66 @@ export function printMarkdown(markdownText = '') {
   console.log(rendered);
 }
 
+/**
+ * Formats a single line of LLM output into clean, human-readable terminal text
+ * without raw markdown symbols (#, **, backticks, etc.).
+ */
+export function formatReadableLine(line = '') {
+  const trimmed = line.trim();
+  if (/^```/.test(trimmed)) return '';
+  if (/^[-*_]{3,}$/.test(trimmed)) return chalk.dim('  ────────────────────────────────────────');
+
+  // Convert markdown headings (# Heading) to clean bold cyan headers
+  const headingMatch = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*$/);
+  if (headingMatch) {
+    const cleanHeading = headingMatch[1]
+      .replace(/\*\*(.+?)\*\*/g, '$1')
+      .replace(/__(.+?)__/g, '$1')
+      .replace(/`([^`]+)`/g, '$1')
+      .trim();
+    return chalk.bold.cyan(cleanHeading);
+  }
+
+  let out = line;
+  // Normalize markdown * or + list bullets to clean dashes
+  out = out.replace(/^(\s*)[*+]\s+/, '$1- ');
+  // Render **bold** and __bold__ cleanly using terminal bold without asterisks
+  out = out.replace(/\*\*(.+?)\*\*/g, (_, inner) => chalk.bold(inner));
+  out = out.replace(/__(.+?)__/g, (_, inner) => chalk.bold(inner));
+  // Strip single-asterisk italics (*text*) while leaving list bullets intact
+  out = out.replace(/(?<!\*)\*([^\s*][^*]*?)\*(?!\*)/g, '$1');
+  // Strip inline code backticks
+  out = out.replace(/`([^`]+)`/g, '$1');
+
+  return out;
+}
+
+/**
+ * Line-buffered stream printer that renders LLM responses incrementally
+ * in clean, easy-to-read formatting as each line completes.
+ */
+export function createReadableStreamPrinter(writeFn = (str) => process.stdout.write(str)) {
+  let buffer = '';
+  return {
+    push(delta = '') {
+      if (!delta) return;
+      buffer += delta;
+      let newlineIdx;
+      while ((newlineIdx = buffer.indexOf('\n')) !== -1) {
+        const rawLine = buffer.slice(0, newlineIdx);
+        buffer = buffer.slice(newlineIdx + 1);
+        writeFn(`${formatReadableLine(rawLine)}\n`);
+      }
+    },
+    flush() {
+      if (buffer.length > 0) {
+        writeFn(formatReadableLine(buffer));
+        buffer = '';
+      }
+    }
+  };
+}
+
 export function printBanner() {
   console.log(chalk.bold.hex('#7C3AED')(`
    ___        _ _ _ _           _   
@@ -40,13 +100,12 @@ export function printBanner() {
 
 export function printHelp() {
   console.log(chalk.bold.cyan('\n  Quillbot Interactive Command Reference:'));
-  console.log(chalk.dim('  Press "/" at the prompt to open the dropdown menu. Select a command and follow the prompts.\n'));
+  console.log(chalk.dim('  Press "/" at the prompt to open the command menu, or type any question directly to search all project files.\n'));
   const commands = [
     ['/write', 'Write or edit beats sequentially or targeted beat-by-beat'],
     ['/plan', 'Plan or revise chapter beats, or add new beats'],
-    ['/bible', 'Query lore, create/edit bible files, list documents, or save lore'],
+    ['/bible', 'Query Story Bible canon files, or create/edit/list/save lore'],
     ['/export', 'Export specific chapter, range (e.g. 1-3), or entire manuscript'],
-    ['/chat', 'Conversational consultation with Story Bible and project context'],
     ['/status', 'View active chapter, beat, tracked files, and chunk counts'],
     ['/sync', 'Manually trigger incremental file sync to local hybrid index'],
     ['/config', 'Launch interactive onboarding & settings wizard'],

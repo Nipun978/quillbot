@@ -592,12 +592,18 @@ export async function runWriteChapterWorkflow({
       ? config.enhancedWritingStyle.trim()
       : (config.writingStyle || '');
 
+    const globalInstructionsBlock = instructions && instructions.trim()
+      ? (activeStyle && !instructions.includes(activeStyle)
+          ? `${activeStyle}\n\n${instructions.trim()}`
+          : instructions.trim())
+      : (activeStyle || '(Deliver immersive, sensory-rich prose in consistent POV and tense.)');
+
     // STATIC PREFIX (System Message): Byte-identical for EVERY beat in Chapter N to maximize Groq prefix caching
     const systemPrompt = `You are an acclaimed novelist writing narrative prose for a novel chapter.
 You write ONE BEAT at a time with uncompromising psychological depth, sensory immersion, and scene grounding.
 
 <global_writing_instructions>
-${activeStyle || '(Deliver immersive, sensory-rich prose in consistent POV and tense.)'}
+${globalInstructionsBlock}
 </global_writing_instructions>
 ${chapterInstructions ? `\n<chapter_writing_instructions>\n${chapterInstructions}\n</chapter_writing_instructions>\n` : ''}
 ${WRITE_BEAT_SYSTEM_PROMPT}`;
@@ -643,12 +649,14 @@ ${beatEditNotes || 'Enhance the sensory immersion, dialogue rhythm, emotional de
     let beatAccepted = false;
 
     while (!beatAccepted) {
-      // Dynamic suffix per beat
-      const dynamicUserPrompt = `${storyBibleXml ? `${storyBibleXml}\n\n` : ''}${macroContinuityBlock ? `<macro_story_continuity>\n${macroContinuityBlock}\n</macro_story_continuity>\n\n` : ''}<chapter_scene_progression>
+      // Dynamic user prompt structured for Groq KV-prefix caching:
+      // Invariant chapter foundation & macro continuity first, followed by scene progression,
+      // and dynamic per-beat lore and target beat details at the end.
+      const dynamicUserPrompt = `${macroContinuityBlock ? `<macro_story_continuity>\n${macroContinuityBlock}\n</macro_story_continuity>\n\n` : ''}<chapter_scene_progression>
 ${sceneProgressionBlock}
 </chapter_scene_progression>
 
-### Immediate Narrative Seam:
+${storyBibleXml ? `${storyBibleXml}\n\n` : ''}### Immediate Narrative Seam:
 #### Verbatim Final Words from Preceding Scene:
 ${activeLastSnippet ? `"...${activeLastSnippet}"` : '(Opening of the chapter - establish setting and atmosphere)'}
 ${downstreamContext ? `\n${downstreamContext}` : ''}
@@ -701,13 +709,18 @@ ${isRevision ? `Write the revised and improved narrative prose for Beat ${beat.n
       if (config.generation?.enableContinuityCritic !== false) {
         const criticSpinner = createSpinner('Running Continuity Critic check against Story Bible & timeline...').start();
         try {
+          const pastSummariesForCritic = [
+            storySoFar ? `### Story So Far (Chapters 1 to ${Math.max(1, chapterNum - 2)}):\n${storySoFar}` : '',
+            previousChapterSummary ? `### Chapter ${chapterNum - 1} Summary:\n${previousChapterSummary}` : ''
+          ].filter(Boolean).join('\n\n');
+
           criticResult = await runContinuityCritic({
             beatProse,
             beat,
             tier1Chunks: tier1,
             tier2Chunks: tier2,
-            pastChapterSummaries: '',
-            lastProseSnippet,
+            pastChapterSummaries: pastSummariesForCritic,
+            lastProseSnippet: activeLastSnippet,
             planContent,
             groqClient,
             sessionId: `chapter_${chapterNum}_beat_${beat.num}`

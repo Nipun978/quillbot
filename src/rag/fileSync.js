@@ -14,22 +14,34 @@ export async function computeFileHash(filePath) {
   }
 }
 
-export async function getTrackedFiles(cwd = process.cwd()) {
-  const tracked = [];
-
-  // 1. story-bible/ (FLAT constraint: only top-level .md and .txt, no subdirectories)
-  const bibleDir = path.join(cwd, 'story-bible');
+export async function scanMarkdownFiles(dir, cwd = process.cwd()) {
+  const result = [];
   try {
-    const entries = await fs.readdir(bibleDir, { withFileTypes: true });
+    const entries = await fs.readdir(dir, { withFileTypes: true });
     for (const entry of entries) {
-      if (entry.isFile()) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        const subFiles = await scanMarkdownFiles(fullPath, cwd);
+        result.push(...subFiles);
+      } else if (entry.isFile()) {
         const ext = path.extname(entry.name).toLowerCase();
         if (ext === '.md' || ext === '.txt') {
-          tracked.push(path.join('story-bible', entry.name).replace(/\\/g, '/'));
+          const relPath = path.relative(cwd, fullPath).replace(/\\/g, '/');
+          result.push(relPath);
         }
       }
     }
   } catch {}
+  return result;
+}
+
+export async function getTrackedFiles(cwd = process.cwd()) {
+  const tracked = [];
+
+  // 1. story-bible/** (recursive: supports nested lore folders e.g. story-bible/factions/clans.md)
+  const bibleDir = path.join(cwd, 'story-bible');
+  const bibleFiles = await scanMarkdownFiles(bibleDir, cwd);
+  tracked.push(...bibleFiles);
 
   // 2. project/chapter-XX/*.md, *.txt
   const projectDir = path.join(cwd, 'project');
@@ -51,7 +63,12 @@ export async function getTrackedFiles(cwd = process.cwd()) {
     }
   } catch {}
 
-  // 3. conversations/archive/*.md, *.txt
+  // 3. .condensed/** (recursive: story-so-far.md, chapters/chapter-XX/plan.md, prose.md)
+  const condensedDir = path.join(cwd, '.condensed');
+  const condensedFiles = await scanMarkdownFiles(condensedDir, cwd);
+  tracked.push(...condensedFiles);
+
+  // 4. conversations/archive/*.md, *.txt
   const archiveDir = path.join(cwd, 'conversations', 'archive');
   try {
     const entries = await fs.readdir(archiveDir, { withFileTypes: true });
@@ -163,8 +180,7 @@ export function startFileWatcher({
 
   const watcher = chokidar.watch(bibleDir, {
     ignored: /(^|[\/\\])\../, // ignore dotfiles
-    persistent: true,
-    depth: 0 // flat directory constraint
+    persistent: true
   });
 
   watcher

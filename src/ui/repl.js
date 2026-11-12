@@ -5,7 +5,7 @@ import chalk from 'chalk';
 import { printHelp, printBanner, createSpinner, renderQuotaDashboard } from './renderer.js';
 import { loadState } from '../config/stateManager.js';
 import { runInitProjectWorkflow } from '../workflows/initProject.js';
-import { runBibleQuery } from '../workflows/chatBible.js';
+import { runBibleQuery, runGeneralQuery } from '../workflows/chatBible.js';
 import { runPlanChapterWorkflow } from '../workflows/planChapter.js';
 import { runWriteChapterWorkflow } from '../workflows/writeChapter.js';
 import { runExportWorkflow } from '../workflows/exportManuscript.js';
@@ -19,7 +19,6 @@ export const SLASH_COMMANDS = [
   '/plan',
   '/write',
   '/export',
-  '/chat',
   '/archive',
   '/load',
   '/new',
@@ -44,9 +43,8 @@ export async function showSlashCommandMenu() {
   const choices = [
     { name: `${chalk.bold.cyan('/write')}    ${chalk.dim('—')} Write or edit chapter beat-by-beat`, value: '/write' },
     { name: `${chalk.bold.cyan('/plan')}     ${chalk.dim('—')} Plan or edit chapter beats (full chapter or single beat)`, value: '/plan' },
-    { name: `${chalk.bold.cyan('/bible')}    ${chalk.dim('—')} Story Bible lore & files (query, create, edit, list, save)`, value: '/bible' },
+    { name: `${chalk.bold.cyan('/bible')}    ${chalk.dim('—')} Story Bible canon (query, create, edit, list, save)`, value: '/bible' },
     { name: `${chalk.bold.cyan('/export')}   ${chalk.dim('—')} Export chapter, range (e.g. 1-3), or manuscript`, value: '/export' },
-    { name: `${chalk.bold.cyan('/chat')}     ${chalk.dim('—')} Conversational chat with Story Bible RAG`, value: '/chat' },
     { name: `${chalk.bold.cyan('/status')}   ${chalk.dim('—')} View active chapter, beat, and novel statistics`, value: '/status' },
     { name: `${chalk.bold.cyan('/sync')}     ${chalk.dim('—')} Manually trigger incremental sync to LanceDB`, value: '/sync' },
     { name: `${chalk.bold.cyan('/config')}   ${chalk.dim('—')} View or update Quillbot configuration wizard`, value: '/config' },
@@ -149,16 +147,6 @@ export async function resolveCommandArguments(selected, cwd) {
   } else if (selected === '/bible') {
     // Show the Story Bible menu directly with Query, Create, Edit, List, Save
     return '/bible';
-  } else if (selected === '/chat') {
-    let msg = '';
-    if (process.stdin.isTTY) {
-      try {
-        msg = await promptInput({
-          message: 'Enter your message to chat with Story Bible & project RAG:'
-        });
-      } catch {}
-    }
-    return `/chat ${(msg || '').trim()}`;
   }
 
   return selected;
@@ -238,7 +226,7 @@ export async function startRepl({
 }) {
   enableStdinProtection();
   printBanner();
-  console.log(chalk.dim('Press ') + chalk.bold.cyan('/') + chalk.dim(' anytime to open the command dropdown menu, or type freely to consult lore / chat.\n'));
+  console.log(chalk.dim('Press ') + chalk.bold.cyan('/') + chalk.dim(' anytime for commands, or ask any question directly to search all project files.\n'));
 
   let running = true;
 
@@ -275,6 +263,12 @@ export async function startRepl({
       // Handle Help
       if (input === '/help') {
         printHelp();
+        continue;
+      }
+
+      // Handle deprecated /chat
+      if (input === '/chat' || input.startsWith('/chat ')) {
+        console.log(chalk.yellow('\n/chat has been deprecated. Type your question directly without a slash command to search all project sources, or use /bible to query Story Bible files.\n'));
         continue;
       }
 
@@ -357,7 +351,7 @@ export async function startRepl({
         continue;
       }
 
-      // Handle Bible
+      // Handle Bible (strictly Story Bible files & management)
       if (input.startsWith('/bible')) {
         const query = input.slice(6).trim();
         await runBibleQuery({
@@ -416,10 +410,9 @@ export async function startRepl({
         continue;
       }
 
-      // Handle Chat or default free text -> treats as /bible consultation
-      const query = input.startsWith('/chat') ? input.slice(5).trim() : input;
-      await runBibleQuery({
-        query,
+      // Default free text (no slash command) -> searches all project sources (Story Bible, chapters, condensed files, notes)
+      await runGeneralQuery({
+        query: input,
         cwd,
         groqClient,
         vectorStore,

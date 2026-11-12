@@ -120,13 +120,30 @@ export class VectorStore {
     }
   }
 
+  _buildWhereClause({ sourceTypes = null, authorityTiers = null } = {}) {
+    const clauses = [];
+    if (Array.isArray(sourceTypes) && sourceTypes.length > 0) {
+      const quoted = sourceTypes.map((t) => `'${String(t).replace(/'/g, "''")}'`).join(', ');
+      clauses.push(`source_type IN (${quoted})`);
+    }
+    if (Array.isArray(authorityTiers) && authorityTiers.length > 0) {
+      const nums = authorityTiers.map((n) => Number(n)).filter((n) => !Number.isNaN(n));
+      if (nums.length > 0) {
+        clauses.push(`authority_tier IN (${nums.join(', ')})`);
+      }
+    }
+    return clauses.join(' AND ');
+  }
+
   async hybridSearch({
     queryText,
     queryVector,
     vectorTopK = 15,
     bm25TopK = 15,
     rrfK = 60,
-    authorityBoosts = { 1: 1.25, 2: 1.10, 3: 1.00 }
+    authorityBoosts = { 1: 1.08, 2: 1.05, 3: 0.95 },
+    sourceTypes = null,
+    authorityTiers = null
   }) {
     if (!this.table) {
       return [];
@@ -137,14 +154,17 @@ export class VectorStore {
       return [];
     }
 
+    const whereClause = this._buildWhereClause({ sourceTypes, authorityTiers });
+
     // 1. Vector Search
     let vectorHits = [];
     if (queryVector && queryVector.length > 0) {
       try {
-        vectorHits = await this.table
-          .vectorSearch(queryVector)
-          .limit(vectorTopK)
-          .toArray();
+        let vecQuery = this.table.vectorSearch(queryVector);
+        if (whereClause && typeof vecQuery.where === 'function') {
+          vecQuery = vecQuery.where(whereClause);
+        }
+        vectorHits = await vecQuery.limit(vectorTopK).toArray();
       } catch (err) {
         vectorHits = [];
       }
@@ -154,13 +174,14 @@ export class VectorStore {
     let bm25Hits = [];
     if (queryText && queryText.trim()) {
       try {
-        // Clean query text for FTS search
-        const cleanQuery = queryText.replace(/[^\w\s]/g, ' ').trim();
+        // Clean query text for FTS search (preserving Unicode letters and numbers)
+        const cleanQuery = queryText.replace(/[^\p{L}\p{N}\s]/gu, ' ').trim();
         if (cleanQuery) {
-          bm25Hits = await this.table
-            .search(cleanQuery, 'fts')
-            .limit(bm25TopK)
-            .toArray();
+          let ftsQuery = this.table.search(cleanQuery, 'fts');
+          if (whereClause && typeof ftsQuery.where === 'function') {
+            ftsQuery = ftsQuery.where(whereClause);
+          }
+          bm25Hits = await ftsQuery.limit(bm25TopK).toArray();
         }
       } catch (err) {
         bm25Hits = [];
@@ -214,6 +235,15 @@ export class VectorStore {
 
     // Sort descending by RRF score
     candidates.sort((a, b) => b.rrfScore - a.rrfScore);
+
+    if ((Array.isArray(sourceTypes) && sourceTypes.length > 0) || (Array.isArray(authorityTiers) && authorityTiers.length > 0)) {
+      return candidates.filter((c) => {
+        const matchType = !sourceTypes?.length || sourceTypes.includes(c.source_type);
+        const matchTier = !authorityTiers?.length || authorityTiers.includes(Number(c.authority_tier));
+        return matchType && matchTier;
+      });
+    }
+
     return candidates;
   }
 }

@@ -56,31 +56,23 @@ Rules:
 - Retain proper nouns and key thematic terms.
 - Output ONLY the rewritten search query as plain text. Do not add quotes, explanations, or punctuation headers.`;
 
-export const INIT_BIBLE_SYSTEM_PROMPT = `You are an expert novelist and world-builder assisting an author with launching their novel.
-The author will provide the project title, writing style preferences, and a "Story in a nutshell" synopsis.
-Your task is to synthesize this synopsis into four foundational, comprehensive, flat Story Bible files.
+export const BIBLE_QUERY_IMPROVISE_SYSTEM_PROMPT = `You are a search query improviser for a novel's Story Bible canon database.
+Your task is to transform the author's raw question (using recent conversation context if present) into an explicit, focused, keyword-rich search query optimized for hybrid vector + BM25 search across Story Bible files (characters, locations, magic/technology, factions, lore rules, and plot overview).
 
-You must respond with a JSON object containing EXACTLY four keys:
-{
-  "characters": "markdown content for story-bible/characters.md",
-  "worldAndLore": "markdown content for story-bible/world-and-lore.md",
-  "locations": "markdown content for story-bible/locations.md",
-  "plotOverview": "markdown content for story-bible/plot-overview.md"
-}
+Rules:
+- Resolve any ambiguous pronouns ("he", "she", "they", "there", "it") using the conversation history.
+- Expand implicit lore questions with relevant canonical terms (e.g., character traits, relationships, locations, lore rules, motivations) without inventing facts.
+- Preserve all proper nouns and specific names accurately.
+- Output ONLY the improvised search query as concise plain text (no quotes, explanations, or markdown).`;
 
-CRITICAL FORMATTING & STRUCTURE RULES (NO TABLES):
-- All documents must be structured strictly in cohesive narrative PARAGRAPHS under clean Markdown headers (#, ##, ###).
-- DO NOT USE TABLES, column matrices, or grid layouts. Markdown tables are strictly prohibited as they are difficult for authors to edit.
-- Write in full, expressive paragraphs so the author can easily read, edit, refine, and expand every section in any standard text editor.
-- Respect and embody the author's writing style preferences and project title throughout all descriptions.
+export const GENERAL_QUERY_IMPROVISE_SYSTEM_PROMPT = `You are a search query improviser for an interactive novel writing workspace.
+Your task is to transform the author's raw question or message (using recent conversation context if present) into a clear, comprehensive, keyword-rich search query optimized for hybrid vector + BM25 search across ALL project files: Story Bible canon, full chapter manuscripts, chapter plans, chapter summaries, condensed story-so-far/scene summaries, and archived brainstorming notes.
 
-Document Requirements:
-- "characters": Detail Main Characters and Key Supporting Characters (Name, Role/Archetype, Physical Appearance, Core Motivations, Internal Conflict, Distinct Voice/Mannerisms, Relationships). Write each character's profile using well-structured paragraphs.
-- "worldAndLore": Detail Setting rules, era, social structure, magic/technology systems, cultural taboos, historical events in rich prose paragraphs.
-- "locations": Detail primary settings (Atmosphere, sensory details, significance, key landmarks) in descriptive paragraphs.
-- "plotOverview": High-level 3-act or episodic outline, central conflict, stakes, midpoint shift, climax, and overarching themes in structured narrative paragraphs.
-
-Ensure content is rich, literary, consistent across all four files, and written exclusively in readable paragraphs without any tables.`;
+Rules:
+- Resolve any ambiguous pronouns ("he", "she", "they", "there", "it") using the conversation history.
+- Keep chapter numbers, scene references, character names, locations, and plot events explicit.
+- Expand casual phrasing into precise retrieval keywords covering both static lore and narrative events without inventing facts.
+- Output ONLY the improvised search query as concise plain text (no quotes, explanations, or markdown).`;
 
 // Sequential /init prompts (Requirement 8)
 export const INIT_OVERVIEW_SYSTEM_PROMPT = `You are an expert novelist and story architect.
