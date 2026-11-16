@@ -7,6 +7,7 @@ import {
   CONDENSE_PROSE_SYSTEM_PROMPT,
   UPDATE_STORY_SO_FAR_SYSTEM_PROMPT
 } from '../llm/prompts.js';
+import { getCreativityTemperatures } from './configManager.js';
 
 export const CONDENSED_DIR = '.condensed';
 
@@ -93,6 +94,16 @@ export function formatCondensedBeatsFile(headerTitle, beatsList = []) {
   return `# ${headerTitle}\n\n${blocks.join('\n\n')}\n`;
 }
 
+function isTruncatedOrEmptyCondensed(text = '', prefixRegex = null) {
+  let body = (text || '').trim();
+  if (prefixRegex) {
+    body = body.replace(prefixRegex, '').trim();
+  }
+  if (!body || body.length < 12) return true;
+  if (body.length < 35 && !/[.!?…"”'’)]$/.test(body)) return true;
+  return false;
+}
+
 /**
  * Requirement 2: Condenses a single beat plan using 20B model and stores it in
  * .condensed/chapters/chapter-XX/plan.md under the beat label.
@@ -112,6 +123,8 @@ export async function saveCondensedBeatPlan({
   const planFilePath = path.join(chDir, 'plan.md');
 
   let condensed = '';
+  const creativity = config?.generation?.creativity || config?.creativity || 'medium';
+  const temps = getCreativityTemperatures(creativity);
   if (groqClient && planText) {
     try {
       condensed = await groqClient.chatCompletion({
@@ -123,8 +136,9 @@ export async function saveCondensedBeatPlan({
             content: `Chapter ${chapterNum} Beat ${beatNum}${beatTitle ? ` (${beatTitle})` : ''} Plan to condense:\n\n${planText}`
           }
         ],
-        temperature: 0.2,
+        temperature: temps.temperatureSummaries,
         maxTokens: 1024,
+        reasoningEffort: 'low',
         sessionId: `condense_plan_ch${chapterNum}_b${beatNum}`,
         workflow: 'CONDENSE_BEAT'
       });
@@ -134,14 +148,15 @@ export async function saveCondensedBeatPlan({
     }
   }
 
-  // Fallback if model output is empty or API call failed
-  if (!condensed) {
+  const prefixRegex = new RegExp(`^Beat\\s+${beatNum}(?:\\s*\\([^)]*\\))?:?\\s*`, 'i');
+
+  // Fallback if model output is empty, API call failed, or reasoning exhausted into a mid-sentence fragment
+  if (isTruncatedOrEmptyCondensed(condensed, prefixRegex)) {
     const fallbackClean = planText.replace(/^### Beat \d+:.*?\n/, '').replace(/\n+/g, ' ').slice(0, 120).trim();
     condensed = `${fallbackClean}...`;
   }
 
   // Ensure consistent label
-  const prefixRegex = new RegExp(`^Beat\\s+${beatNum}(?:\\s*\\([^)]*\\))?:?\\s*`, 'i');
   condensed = condensed.replace(prefixRegex, '').trim();
   const formattedBeatText = `Beat ${beatNum} (${beatTitle || 'Scene'}): ${condensed}`;
 
@@ -188,6 +203,8 @@ export async function saveCondensedBeatProse({
   const cleanProse = proseText.replace(/<!-- BEAT \d+ -->/g, '').trim();
 
   let condensed = '';
+  const creativity = config?.generation?.creativity || config?.creativity || 'medium';
+  const temps = getCreativityTemperatures(creativity);
   if (groqClient && cleanProse) {
     try {
       condensed = await groqClient.chatCompletion({
@@ -199,8 +216,9 @@ export async function saveCondensedBeatProse({
             content: `Chapter ${chapterNum} Beat ${beatNum}${beatTitle ? ` (${beatTitle})` : ''} Narrative Prose to condense:\n\n${cleanProse.slice(-3500)}`
           }
         ],
-        temperature: 0.2,
+        temperature: temps.temperatureSummaries,
         maxTokens: 1024,
+        reasoningEffort: 'low',
         sessionId: `condense_prose_ch${chapterNum}_b${beatNum}`,
         workflow: 'CONDENSE_BEAT_PROSE'
       });
@@ -210,13 +228,14 @@ export async function saveCondensedBeatProse({
     }
   }
 
-  // Fallback if model output is empty or API call failed
-  if (!condensed) {
+  const prefixRegex = new RegExp(`^Beat\\s+${beatNum}(?:\\s*\\([^)]*\\))?:?\\s*`, 'i');
+
+  // Fallback if model output is empty, API call failed, or truncated fragment
+  if (isTruncatedOrEmptyCondensed(condensed, prefixRegex)) {
     condensed = `${cleanProse.slice(0, 120).replace(/\n+/g, ' ').trim()}...`;
   }
 
   // Ensure consistent label
-  const prefixRegex = new RegExp(`^Beat\\s+${beatNum}(?:\\s*\\([^)]*\\))?:?\\s*`, 'i');
   condensed = condensed.replace(prefixRegex, '').trim();
   const formattedProseText = `Beat ${beatNum} (${beatTitle || 'Scene'}): ${condensed}`;
 
@@ -295,6 +314,8 @@ export async function updateStorySoFar({
   currentStorySoFar = currentStorySoFar.replace(/\(No chapters written yet\.\)\s*\n?/gi, '').trim();
 
   let pointers = '';
+  const creativity = config?.generation?.creativity || config?.creativity || 'medium';
+  const temps = getCreativityTemperatures(creativity);
   if (groqClient && summaryText) {
     try {
       pointers = await groqClient.chatCompletion({
@@ -306,8 +327,9 @@ export async function updateStorySoFar({
             content: `Chapter ${chapterNum}${chapterTitle ? ` (${chapterTitle})` : ''} 250-word Summary:\n${summaryText.trim()}\n\nGenerate 2 to 3 compact bullet pointers for this chapter strictly under 50 words.`
           }
         ],
-        temperature: 0.2,
+        temperature: temps.temperatureSummaries,
         maxTokens: 1024,
+        reasoningEffort: 'low',
         sessionId: `story_so_far_ch${chapterNum}`,
         workflow: 'UPDATE_STORY_SO_FAR'
       });
@@ -317,7 +339,7 @@ export async function updateStorySoFar({
     }
   }
 
-  if (!pointers) {
+  if (isTruncatedOrEmptyCondensed(pointers)) {
     const sentences = summaryText ? summaryText.replace(/\n+/g, ' ').split(/(?<=[.!?])\s+/).filter(Boolean) : [];
     pointers = sentences.slice(0, 3).join(' ').slice(0, 250) || `Events of Chapter ${chapterNum}.`;
   }
@@ -474,7 +496,8 @@ export async function loadWritingContinuityContext({
   activeBeatNum = 1,
   beatsList = [],
   cwd = process.cwd(),
-  chapterFile = null
+  chapterFile = null,
+  tailWordLimit = 350
 }) {
   const allCondensedProse = await getCondensedBeatProse(chapterNum, cwd);
   const priorCondensedProse = allCondensedProse
@@ -516,7 +539,7 @@ export async function loadWritingContinuityContext({
 
       const words = beatText.replace(/<!-- BEAT \d+ -->/g, '').trim().split(/\s+/);
       if (words.length > 0 && words[0]) {
-        lastProseSnippet = words.slice(-300).join(' ');
+        lastProseSnippet = words.slice(-tailWordLimit).join(' ');
       }
     } catch {}
   }

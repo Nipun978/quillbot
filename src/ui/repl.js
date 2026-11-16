@@ -156,8 +156,9 @@ export const replInputPrompt = createPrompt((config, done) => {
   const [value, setValue] = useState('');
 
   useKeypress((key, rl) => {
-    const isSlash = key.sequence === '/' || key.name === 'slash' || key.sequence?.includes('/') || rl.line?.startsWith('/');
-    // As soon as '/' is pressed or present, trigger command dropdown menu immediately (no speed typing)
+    const currentBuf = rl.line !== undefined ? rl.line : value;
+    const isSlash = currentBuf.startsWith('/') || (value === '' && (key.sequence?.startsWith('/') || key.name === 'slash'));
+    // Trigger command dropdown menu only when '/' starts the command input (not mid-sentence like 'and/or')
     if (isSlash) {
       done({ isSlashMenu: true });
       return;
@@ -175,9 +176,9 @@ export const replInputPrompt = createPrompt((config, done) => {
     }
 
     if (key.name === 'backspace') {
-      setValue(value.slice(0, -1));
+      setValue(rl.line !== undefined ? rl.line : value.slice(0, -1));
     } else if (key.sequence && key.sequence.length === 1 && !key.ctrl && !key.meta) {
-      setValue(rl.line ? rl.line : (value + key.sequence));
+      setValue(rl.line !== undefined ? rl.line : (value + key.sequence));
     } else if (rl.line !== undefined) {
       setValue(rl.line);
     }
@@ -289,6 +290,8 @@ export async function startRepl({
         if (config.enhancedWritingStyle) {
           console.log(`  Enhanced Style:     ${chalk.green('Active (AI-Enhanced Guide incorporated)')}`);
         }
+        const reasoningEffort = config.generation?.defaultReasoningEffort || 'medium';
+        console.log(`  Reasoning Effort:   ${chalk.green(reasoningEffort.toUpperCase())} (Fidelity: STRICT ZERO-INVENTION | Plan temp: 0.1, Write temp: 0.3)`);
         console.log(`  Active Chapter:     ${chalk.green(state.activeChapter || 1)}`);
         console.log(`  Active Beat:        ${chalk.green(state.activeBeat || 1)}`);
         console.log(`  Active Session:     ${chalk.green(conversationMgr.current?.id || 'none')}`);

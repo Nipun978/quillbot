@@ -30,7 +30,8 @@ export class CrossEncoderReranker {
     queryText,
     candidates = [],
     topK = this.topK,
-    authorityBoosts = null
+    authorityBoosts = null,
+    minScore = 0
   }) {
     if (!candidates || candidates.length === 0) return [];
     if (!queryText || !queryText.trim()) {
@@ -40,12 +41,14 @@ export class CrossEncoderReranker {
     try {
       await this._load();
 
-      // Only rerank the top candidates (up to 15)
-      const subset = candidates.slice(0, 15);
+      // Rerank top fused candidates (up to 20)
+      const subset = candidates.slice(0, 20);
       const scored = [];
 
       for (const item of subset) {
-        const docText = item.text || item.raw_text || '';
+        const rawText = item.raw_text || item.text || '';
+        // Strip prepended context header so it doesn't consume cross-encoder window or bias scoring
+        const docText = rawText.replace(/^\[File:[^\]]+\]\s*\r?\n?/, '');
         // Truncate document text to reasonable token length for cross-encoder
         const truncatedDoc = docText.slice(0, 1500);
 
@@ -60,20 +63,22 @@ export class CrossEncoderReranker {
         const normScore = sigmoid(rawLogit);
 
         const tier = Number(item.authority_tier) || 3;
-        // Soft additive tie-breaker (+0.02 for Tier 1 canon, +0.01 for Tier 2 manuscript)
+        // Soft additive tie-breaker (+0.02 for Tier 2 manuscript/progress, +0.01 for Tier 1 canon)
         // preserves pure cross-encoder probabilities without double-boosting multiplication
-        const tierBonus = tier === 1 ? 0.02 : (tier === 2 ? 0.01 : 0.0);
+        const tierBonus = tier === 2 ? 0.02 : (tier === 1 ? 0.01 : 0.0);
         const finalScore = normScore + tierBonus;
 
         scored.push({
           ...item,
+          normScore,
           rerankScore: finalScore,
           rawLogit
         });
       }
 
       scored.sort((a, b) => b.rerankScore - a.rerankScore);
-      return scored.slice(0, topK);
+      const filtered = minScore > 0 ? scored.filter((s) => s.normScore >= minScore) : scored;
+      return filtered.slice(0, topK);
     } catch (err) {
       // Fallback: if reranking fails, return topK candidates from RRF order
       return candidates.slice(0, topK);

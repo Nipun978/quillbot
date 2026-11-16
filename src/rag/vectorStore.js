@@ -1,5 +1,7 @@
+import fs from 'node:fs/promises';
 import path from 'node:path';
 import * as lancedb from '@lancedb/lancedb';
+import { loadState, saveState } from '../config/stateManager.js';
 
 const TABLE_NAME = 'quillbot_chunks';
 
@@ -12,13 +14,53 @@ export class VectorStore {
     this.table = null;
   }
 
-  async init() {
-    this.db = await lancedb.connect(this.dbPath);
-    const tableNames = await this.db.tableNames();
-    if (tableNames.includes(TABLE_NAME)) {
-      this.table = await this.db.openTable(TABLE_NAME);
-    } else {
+  _isCorruptError(err) {
+    if (!err) return false;
+    const msg = String(err.message || err).toLowerCase();
+    return (
+      msg.includes('magic number does not match') ||
+      msg.includes('invalid format') ||
+      msg.includes('corrupted') ||
+      msg.includes('manifest.rs') ||
+      msg.includes('lanceerror(io)')
+    );
+  }
+
+  async repairCorruptedIndex() {
+    console.warn('[VectorStore] Corrupted LanceDB index detected (magic number mismatch or incomplete write). Auto-repairing...');
+    await this.close();
+    try {
+      await fs.rm(this.dbPath, { recursive: true, force: true });
+      await fs.mkdir(this.dbPath, { recursive: true });
+    } catch {}
+    try {
+      const state = await loadState(this.cwd);
+      state.fileHashes = {};
+      await saveState(state, this.cwd);
+    } catch {}
+    try {
+      this.db = await lancedb.connect(this.dbPath);
       this.table = null;
+    } catch {}
+    console.log('[VectorStore] LanceDB index directory reset. State file hashes cleared for re-indexing.');
+  }
+
+  async init() {
+    try {
+      this.db = await lancedb.connect(this.dbPath);
+      const tableNames = await this.db.tableNames();
+      if (tableNames.includes(TABLE_NAME)) {
+        this.table = await this.db.openTable(TABLE_NAME);
+        await this.table.countRows();
+      } else {
+        this.table = null;
+      }
+    } catch (err) {
+      if (this._isCorruptError(err)) {
+        await this.repairCorruptedIndex();
+      } else {
+        throw err;
+      }
     }
     return this;
   }
@@ -80,6 +122,9 @@ export class VectorStore {
         });
       }
     } catch (err) {
+      if (this._isCorruptError(err)) {
+        await this.repairCorruptedIndex();
+      }
       // If index already exists or FTS not available, log warning
       // but do not crash
     }
@@ -100,11 +145,20 @@ export class VectorStore {
       vector: Array.from(c.vector)
     }));
 
-    if (!this.table) {
-      await this._ensureTable(rows);
-    } else {
-      await this.table.add(rows);
-      await this.rebuildFtsIndex();
+    try {
+      if (!this.table) {
+        await this._ensureTable(rows);
+      } else {
+        await this.table.add(rows);
+        await this.rebuildFtsIndex();
+      }
+    } catch (err) {
+      if (this._isCorruptError(err)) {
+        await this.repairCorruptedIndex();
+        await this._ensureTable(rows);
+      } else {
+        throw err;
+      }
     }
   }
 
@@ -115,7 +169,10 @@ export class VectorStore {
       // Escape single quotes for SQL filter
       const escaped = normalized.replace(/'/g, "''");
       await this.table.delete(`source_path = '${escaped}'`);
-    } catch {
+    } catch (err) {
+      if (this._isCorruptError(err)) {
+        await this.repairCorruptedIndex();
+      }
       // Table may be empty
     }
   }
@@ -141,7 +198,7 @@ export class VectorStore {
     vectorTopK = 15,
     bm25TopK = 15,
     rrfK = 60,
-    authorityBoosts = { 1: 1.08, 2: 1.05, 3: 0.95 },
+    authorityBoosts = { 1: 1.05, 2: 1.10, 3: 0.95 },
     sourceTypes = null,
     authorityTiers = null
   }) {
@@ -149,101 +206,111 @@ export class VectorStore {
       return [];
     }
 
-    const rowCount = await this.table.countRows();
-    if (rowCount === 0) {
-      return [];
-    }
-
-    const whereClause = this._buildWhereClause({ sourceTypes, authorityTiers });
-
-    // 1. Vector Search
-    let vectorHits = [];
-    if (queryVector && queryVector.length > 0) {
-      try {
-        let vecQuery = this.table.vectorSearch(queryVector);
-        if (whereClause && typeof vecQuery.where === 'function') {
-          vecQuery = vecQuery.where(whereClause);
-        }
-        vectorHits = await vecQuery.limit(vectorTopK).toArray();
-      } catch (err) {
-        vectorHits = [];
+    try {
+      const rowCount = await this.table.countRows();
+      if (rowCount === 0) {
+        return [];
       }
-    }
 
-    // 2. BM25 Full-Text Search
-    let bm25Hits = [];
-    if (queryText && queryText.trim()) {
-      try {
-        // Clean query text for FTS search (preserving Unicode letters and numbers)
-        const cleanQuery = queryText.replace(/[^\p{L}\p{N}\s]/gu, ' ').trim();
-        if (cleanQuery) {
-          let ftsQuery = this.table.search(cleanQuery, 'fts');
-          if (whereClause && typeof ftsQuery.where === 'function') {
-            ftsQuery = ftsQuery.where(whereClause);
+      const whereClause = this._buildWhereClause({ sourceTypes, authorityTiers });
+
+      // 1. Vector Search
+      let vectorHits = [];
+      if (queryVector && queryVector.length > 0) {
+        try {
+          let vecQuery = this.table.vectorSearch(queryVector);
+          if (whereClause && typeof vecQuery.where === 'function') {
+            vecQuery = vecQuery.where(whereClause);
           }
-          bm25Hits = await ftsQuery.limit(bm25TopK).toArray();
+          vectorHits = await vecQuery.limit(vectorTopK).toArray();
+        } catch (err) {
+          if (this._isCorruptError(err)) throw err;
+          vectorHits = [];
         }
-      } catch (err) {
-        bm25Hits = [];
       }
-    }
 
-    // 3. Reciprocal Rank Fusion (RRF) with Authority Tier Boosts
-    const fusedMap = new Map();
+      // 2. BM25 Full-Text Search
+      let bm25Hits = [];
+      if (queryText && queryText.trim()) {
+        try {
+          // Clean query text for FTS search (preserving Unicode letters and numbers)
+          const cleanQuery = queryText.replace(/[^\p{L}\p{N}\s]/gu, ' ').trim();
+          if (cleanQuery) {
+            let ftsQuery = this.table.search(cleanQuery, 'fts');
+            if (whereClause && typeof ftsQuery.where === 'function') {
+              ftsQuery = ftsQuery.where(whereClause);
+            }
+            bm25Hits = await ftsQuery.limit(bm25TopK).toArray();
+          }
+        } catch (err) {
+          if (this._isCorruptError(err)) throw err;
+          bm25Hits = [];
+        }
+      }
 
-    // Map ranks (1-indexed)
-    vectorHits.forEach((hit, idx) => {
-      const rank = idx + 1;
-      const existing = fusedMap.get(hit.id) || {
-        chunk: hit,
-        vectorRank: Infinity,
-        bm25Rank: Infinity
-      };
-      existing.vectorRank = rank;
-      existing.chunk = hit;
-      fusedMap.set(hit.id, existing);
-    });
+      // 3. Reciprocal Rank Fusion (RRF) with Authority Tier Boosts
+      const fusedMap = new Map();
 
-    bm25Hits.forEach((hit, idx) => {
-      const rank = idx + 1;
-      const existing = fusedMap.get(hit.id) || {
-        chunk: hit,
-        vectorRank: Infinity,
-        bm25Rank: Infinity
-      };
-      existing.bm25Rank = rank;
-      existing.chunk = hit;
-      fusedMap.set(hit.id, existing);
-    });
-
-    const candidates = [];
-    for (const [id, entry] of fusedMap.entries()) {
-      const tier = Number(entry.chunk.authority_tier) || 3;
-      const tierBoost = authorityBoosts[tier] ?? 1.0;
-
-      const vScore = entry.vectorRank !== Infinity ? 1 / (rrfK + entry.vectorRank) : 0;
-      const bScore = entry.bm25Rank !== Infinity ? 1 / (rrfK + entry.bm25Rank) : 0;
-      const rrfScore = tierBoost * (vScore + bScore);
-
-      candidates.push({
-        ...entry.chunk,
-        rrfScore,
-        vectorRank: entry.vectorRank,
-        bm25Rank: entry.bm25Rank
+      // Map ranks (1-indexed)
+      vectorHits.forEach((hit, idx) => {
+        const rank = idx + 1;
+        const existing = fusedMap.get(hit.id) || {
+          chunk: hit,
+          vectorRank: Infinity,
+          bm25Rank: Infinity
+        };
+        existing.vectorRank = rank;
+        existing.chunk = hit;
+        fusedMap.set(hit.id, existing);
       });
-    }
 
-    // Sort descending by RRF score
-    candidates.sort((a, b) => b.rrfScore - a.rrfScore);
-
-    if ((Array.isArray(sourceTypes) && sourceTypes.length > 0) || (Array.isArray(authorityTiers) && authorityTiers.length > 0)) {
-      return candidates.filter((c) => {
-        const matchType = !sourceTypes?.length || sourceTypes.includes(c.source_type);
-        const matchTier = !authorityTiers?.length || authorityTiers.includes(Number(c.authority_tier));
-        return matchType && matchTier;
+      bm25Hits.forEach((hit, idx) => {
+        const rank = idx + 1;
+        const existing = fusedMap.get(hit.id) || {
+          chunk: hit,
+          vectorRank: Infinity,
+          bm25Rank: Infinity
+        };
+        existing.bm25Rank = rank;
+        existing.chunk = hit;
+        fusedMap.set(hit.id, existing);
       });
-    }
 
-    return candidates;
+      const candidates = [];
+      for (const [id, entry] of fusedMap.entries()) {
+        const tier = Number(entry.chunk.authority_tier) || 3;
+        const tierBoost = authorityBoosts[tier] ?? 1.0;
+
+        const vScore = entry.vectorRank !== Infinity ? 1 / (rrfK + entry.vectorRank) : 0;
+        const bScore = entry.bm25Rank !== Infinity ? 1 / (rrfK + entry.bm25Rank) : 0;
+        const rrfScore = tierBoost * (vScore + bScore);
+
+        candidates.push({
+          ...entry.chunk,
+          rrfScore,
+          vectorRank: entry.vectorRank,
+          bm25Rank: entry.bm25Rank
+        });
+      }
+
+      // Sort descending by RRF score
+      candidates.sort((a, b) => b.rrfScore - a.rrfScore);
+
+      if ((Array.isArray(sourceTypes) && sourceTypes.length > 0) || (Array.isArray(authorityTiers) && authorityTiers.length > 0)) {
+        return candidates.filter((c) => {
+          const matchType = !sourceTypes?.length || sourceTypes.includes(c.source_type);
+          const matchTier = !authorityTiers?.length || authorityTiers.includes(Number(c.authority_tier));
+          return matchType && matchTier;
+        });
+      }
+
+      return candidates;
+    } catch (err) {
+      if (this._isCorruptError(err)) {
+        await this.repairCorruptedIndex();
+        return [];
+      }
+      throw err;
+    }
   }
 }

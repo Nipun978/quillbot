@@ -99,10 +99,13 @@ export function chunkDocument({
     const headingMatch = line.match(/^(#{1,4})\s+(.+)$/);
     if (headingMatch) {
       if (currentBuffer.length > 0) {
-        sections.push({
-          title: currentTitle,
-          text: currentBuffer.join('\n').trim()
-        });
+        const cleanSectionText = currentBuffer.join('\n').replace(/^\s*---\s*$/gm, '').trim();
+        if (cleanSectionText) {
+          sections.push({
+            title: currentTitle,
+            text: cleanSectionText
+          });
+        }
         currentBuffer = [];
       }
       currentTitle = headingMatch[2].trim();
@@ -113,15 +116,49 @@ export function chunkDocument({
   }
 
   if (currentBuffer.length > 0) {
-    sections.push({
-      title: currentTitle,
-      text: currentBuffer.join('\n').trim()
-    });
+    const cleanSectionText = currentBuffer.join('\n').replace(/^\s*---\s*$/gm, '').trim();
+    if (cleanSectionText) {
+      sections.push({
+        title: currentTitle,
+        text: cleanSectionText
+      });
+    }
+  }
+
+  // Merge heading-only sections (e.g., "## Protagonist" immediately followed by "### **Debu**")
+  // forward into the following content section so parent headings never become 2-token orphan chunks.
+  const mergedSections = [];
+  let pendingHeadingPrefix = [];
+  for (const section of sections) {
+    if (!section.text) continue;
+    const isHeadingOnly = /^(?:#{1,6}\s+[^\n]+(?:\n+|$))+$/.test(section.text.trim());
+    if (isHeadingOnly) {
+      pendingHeadingPrefix.push(section.text.trim());
+    } else if (pendingHeadingPrefix.length > 0) {
+      mergedSections.push({
+        title: section.title,
+        text: `${pendingHeadingPrefix.join('\n')}\n${section.text}`
+      });
+      pendingHeadingPrefix = [];
+    } else {
+      mergedSections.push(section);
+    }
+  }
+  if (pendingHeadingPrefix.length > 0) {
+    if (mergedSections.length > 0) {
+      const last = mergedSections[mergedSections.length - 1];
+      last.text = `${last.text}\n\n${pendingHeadingPrefix.join('\n')}`;
+    } else {
+      mergedSections.push({
+        title: currentTitle,
+        text: pendingHeadingPrefix.join('\n')
+      });
+    }
   }
 
   const rawChunks = [];
 
-  for (const section of sections) {
+  for (const section of mergedSections) {
     if (!section.text) continue;
 
     if (estimateTokenCount(section.text) <= chunkSizeTokens) {

@@ -4,10 +4,10 @@
 
 **Quillbot** is a turn-based, interactive CLI story-writing agent designed for fiction authors and novelists. It transforms a standard terminal into an intelligent creative studio by pairing cloud inference via **Groq** with an entirely local, offline-capable **Hybrid RAG** (Retrieval-Augmented Generation) pipeline.
 
-Unlike generic AI writing tools that produce disjointed prose or suffer from context drift, Quillbot treats novel writing as a disciplined, iterative, and architecture-guided craft. It enforces a strict **Hierarchy of Truth** anchored in a flat **Story Bible**, plans narratives into deterministic **Beats**, writes scenes incrementally with human-in-the-loop review, and audits every beat with an automated **Continuity Critic**.
+Unlike generic AI writing tools that produce disjointed prose or suffer from context drift, Quillbot treats novel writing as a disciplined, iterative, and architecture-guided craft. It enforces a strict **Hierarchy of Truth** anchored in the **Story Bible**, plans narratives into deterministic **Beats**, writes scenes incrementally with human-in-the-loop review, and audits every beat with an automated **Continuity Critic**.
 
 ### Core Value Propositions
-- **Story Bible as Absolute Truth (Tier 1):** Flat, easily editable markdown files (`story-bible/*.md`) dictate canon, character traits, lore, and world rules.
+- **Story Bible as Absolute Truth (Tier 1):** Easily editable markdown/text files (`story-bible/**/*.md` and `.txt`, supporting nested folders) dictate canon, character traits, lore, and world rules.
 - **Local Hybrid Retrieval (Vector + BM25 + Cross-Encoder Reranking):** Semantic search (via Ollama `embeddinggemma`) and lexical keyword search (via LanceDB BM25 FTS) are merged using Reciprocal Rank Fusion (RRF) and scored locally on CPU by a 23MB ONNX Cross-Encoder model.
 - **Beat-by-Beat Prose Engine:** Writes prose one beat at a time with instant review gates (`[A]ccept`, `[R]etry`, `[E]dit`, `[F]ix`, `[P]ause`), preventing narrative rush and hallucination.
 - **Non-Destructive Editing & Safety Backups:** Automatically creates timestamped backups in `.quillbot/backups/` before modifying existing chapters or bible files.
@@ -91,12 +91,14 @@ quillbot/
 │   ├── index.js                # Bootstrap orchestrator, health checks, & startup sequence
 │   ├── config/
 │   │   ├── backupManager.js    # Pre-write safety backups in .quillbot/backups/
+│   │   ├── condensedManager.js # Token-efficient .condensed/ scene plans & story-so-far memory
 │   │   ├── configManager.js    # .quillbot/config.json, instructions.md, & setup wizard
 │   │   ├── logger.js           # Comprehensive LLM request/response payload logger
 │   │   └── stateManager.js     # .quillbot/state.json tracker (hashes, active chapter/beat)
 │   ├── llm/
-│   │   ├── groqClient.js       # Streaming, standard, and JSON completions with Groq SDK
-│   │   └── prompts.js          # XML Hierarchy of Truth prompts, beat schemas, and critic
+│   │   ├── groqClient.js       # Streaming, standard, and JSON completions with Groq SDK & retry
+│   │   ├── prompts.js          # XML Hierarchy of Truth prompts, beat schemas, and critic
+│   │   └── quotaManager.js     # Groq rate-limit probing & local token budget tracker
 │   ├── rag/
 │   │   ├── chunker.js          # Header-aware markdown splitting with context metadata prefixing
 │   │   ├── embedder.js         # Local Ollama /api/embed client (embeddinggemma)
@@ -122,6 +124,11 @@ quillbot/
 │   ├── rag.test.js             # Chunker, vector store, reranker, and file sync tests
 │   ├── v2features.test.js      # Targeted single-beat writes, continuity critic, & export
 │   ├── v3features.test.js      # Ollama manager, out-of-order writes, beat edits, & REPL guards
+│   ├── v4quota.test.js         # Quota manager tracking, free/paid tier gating, & retry tests
+│   ├── v6condensedFlow.test.js # Condensed continuity horizon & story-so-far flow tests
+│   ├── v7auditFixes.test.js    # Architectural audit fixes & KV-prefix ordering tests
+│   ├── v8queryRouting.test.js  # Query routing, readable streaming, & scoped RAG tests
+│   ├── v9integration.test.js   # Non-mocked HTTP, Ollama, LanceDB, ONNX & watcher tests
 │   └── workflows.test.js       # Parsing, continuity windowing, and slash completion
 ├── package.json                # Project dependencies, scripts, and engine constraints
 └── plan.md                     # Original product architecture specification
@@ -141,11 +148,17 @@ When Quillbot initializes in any novel directory, it creates and maintains this 
 │   ├── state.json              # File SHA-256 hashes, active chapter, active beat index
 │   ├── backups/                # Timestamped safety backups of modified files
 │   └── index/                  # Local LanceDB vector & BM25 tables (quillbot_chunks.lance)
-├── story-bible/                # FLAT directory (.md and .txt only, no subfolders) [Tier 1 Canon]
+├── story-bible/                # Directory (.md and .txt, flat or nested subfolders) [Tier 1 Canon]
 │   ├── characters.md           # Character sheets, relationships, appearances, motivations
 │   ├── world-and-lore.md       # Magic/technology systems, historical timeline, rules
 │   ├── locations.md            # Sensory descriptions, geography, key landmarks
 │   └── plot-overview.md        # Major narrative arcs, act structures, thematic stakes
+├── .condensed/                 # Compact rolling continuity summaries [Tier 2 Progress]
+│   ├── story-so-far.md         # Multi-chapter canonical bullet progression
+│   └── chapters/
+│       └── chapter-XX/
+│           ├── plan.md         # Condensed beat plans
+│           └── prose.md        # Condensed beat prose outcomes
 ├── project/                    # Chapter manuscripts and beat outlines [Tier 2 Canon]
 │   ├── chapter-01/
 │   │   ├── plan.md             # Summary and structured beats (Beat 1, Beat 2, ...)
@@ -190,15 +203,15 @@ sequenceDiagram
         Lance-->>App: BM25 Lexical Candidates
     end
     App->>App: Reciprocal Rank Fusion (RRF) with Authority Tier Multipliers
-    App->>Rerank: rerank(queryText, top15Candidates, topK=5)
+    App->>Rerank: rerank(queryText, top20Candidates, topK=5)
     Rerank-->>App: Scored & Ranked Chunks
     App->>LLM: Stream completion with Tiered XML Context
 ```
 
 #### 1. Header-Aware Chunking & Context Header Prepending (`chunker.js`)
-- Enforces the flat `story-bible/` constraint (only top-level `.md` and `.txt` files).
-- Splits markdown files by headings (`#`, `##`, `###`), preserving cohesive blocks under 400 tokens (~1,600 characters). Larger sections are subdivided by double newline with a 60-token overlap.
-- Prepend each chunk with its source metadata:
+- Indexes `.md` and `.txt` files across `story-bible/` (including nested subfolders), `project/`, `.condensed/`, and `conversations/archive/`.
+- Splits markdown files by headings (`#`, `##`, `###`), merging heading-only blocks forward into their subsequent content section and preserving cohesive blocks under 400 tokens (~1,600 characters). Larger sections are subdivided by double newline with a 60-token overlap.
+- Prepends each chunk with its source metadata for lexical matching while `embedTexts` embeds semantic section title + body without noisy bracket tags:
   ```text
   [File: story-bible/characters.md | Section: Jonathan Blackwood | Type: story-bible | Tier: 1]
   <chunk_body>
@@ -214,14 +227,14 @@ The hits are merged using Reciprocal Rank Fusion with authority tier multipliers
 
 $$\text{RRF\_Score}(d) = w_{\text{tier}} \times \left( \frac{1}{k + \text{rank}_{\text{vector}}(d)} + \frac{1}{k + \text{rank}_{\text{bm25}}(d)} \right)$$
 
-- **Tier 1 (Story Bible):** $w_{\text{tier}} = 1.25$ (Highest priority canon)
-- **Tier 2 (Manuscript Chapters & Summaries):** $w_{\text{tier}} = 1.10$ (Established manuscript)
-- **Tier 3 (Archived Conversations):** $w_{\text{tier}} = 1.00$ (Brainstorming notes)
+- **Tier 1 (Story Bible):** $w_{\text{tier}} = 1.08$ (Highest priority canon)
+- **Tier 2 (Manuscript Chapters & `.condensed` Progress):** $w_{\text{tier}} = 1.05$ (Established manuscript)
+- **Tier 3 (Archived Conversations):** $w_{\text{tier}} = 0.95$ (Brainstorming notes)
 
 #### 3. Local ONNX Cross-Encoder Reranker (`reranker.js`)
 - Uses `@huggingface/transformers` to lazy-load `Xenova/ms-marco-MiniLM-L-6-v2`.
-- Evaluates the top 15 fused candidates by tokenizing `(query, document_text)` pairs directly on the CPU in $<40\text{ms}$ without requiring Python.
-- Applies a sigmoid function to raw logits and scales by $w_{\text{tier}}$ to return the definitive top 5 chunks.
+- Evaluates the top 20 fused candidates (stripping the leading `[File: ...]` tag before scoring) by tokenizing `(query, document_text)` pairs directly on the CPU without requiring Python.
+- Applies a sigmoid function to raw logits and adds a soft additive tie-breaker (`+0.02` for Tier 1 canon, `+0.01` for Tier 2 manuscript), with optional `minScore` filtering, to return the top ranked chunks.
 
 #### 4. Automated Ollama Supervisor (`ollamaManager.js` & `embedder.js`)
 - Detects whether the configured base URL is local (`127.0.0.1`, `localhost`).
@@ -231,29 +244,32 @@ $$\text{RRF\_Score}(d) = w_{\text{tier}} \times \left( \frac{1}{k + \text{rank}_
 
 ### 5.2 The Hierarchy of Truth & Prompt Engineering
 
-Quillbot enforces a strict truth hierarchy in all prompt templates using explicit XML delimiters (`src/llm/prompts.js`):
+Quillbot enforces a strict truth and instruction hierarchy in all prompt templates using explicit XML delimiters (`src/llm/prompts.js`):
 
 ```xml
 <system_instructions>
-# Author Writing Style Preferences & Guidelines
+# Author Writing Style Preferences & Core Directives
 </system_instructions>
 
 <hierarchy_of_truth_rules>
-You must strictly obey the following source hierarchy when answering or writing:
-1. TIER 1 (ABSOLUTE CANON - STORY BIBLE): Facts inside <story_bible_canon> are absolute law. Never contradict them.
-2. TIER 2 (ESTABLISHED MANUSCRIPT - PAST CHAPTERS): Events inside <past_chapters> have already occurred in the story. Maintain strict continuity with them unless overridden by Tier 1.
-3. TIER 3 (PAST CONVERSATIONS): Notes inside <past_conversations> represent earlier brainstorming. Ignore them if they conflict with Tier 1 or Tier 2.
-</hierarchy_of_truth_rules>
+Source Truth Precedence:
+1. Past Chapters & Progress (Highest Precedence — established manuscript events, chapter summaries, and condensed progress override earlier global lore)
+2. Story Bible Canon (Global Baseline Lore — foundational world rules, character dossiers, and overarching timeline)
+3. Past Conversations (Brainstorming Notes — exploratory ideation, lowest precedence)
 
-<story_bible_canon>
-[Source: story-bible/characters.md - Section: Jonathan]
-Jonathan is 32 years old, left-handed, with a scarred eyebrow.
-</story_bible_canon>
+Instruction Precedence:
+Beat-Specific Instructions > Chapter-Level Instructions > Global Writing Style.
+</hierarchy_of_truth_rules>
 
 <past_chapters>
 ### Chapter 1 Summary:
 Jonathan arrived at Oakhaven and met Rowan at dusk.
 </past_chapters>
+
+<story_bible_canon>
+[Source: story-bible/characters.md - Section: Jonathan]
+Jonathan is 32 years old, left-handed, with a scarred eyebrow.
+</story_bible_canon>
 
 <past_conversations>
 ### Rolling Discussion Summary:
@@ -270,21 +286,25 @@ Prompts sent to `openai/gpt-oss-120b` place invariant context (system instructio
 
 The writing workflow (`src/workflows/writeChapter.js`) breaks chapter writing into micro-units called **Beats**.
 
-#### 1. Plan Schema
-Plans (`project/chapter-XX/plan.md`) use clean Markdown paragraphs (no tables) parsable by regex `/^### Beat (\d+): (.*?)$/gm`:
+#### 1. Plan Schema (Technical Blueprints)
+Plans (`project/chapter-XX/plan.md`) use clean Markdown (no tables) parsable by regex `/^### Beat (\d+): (.*?)$/gm`. Plans read like technical architectural blueprints rather than pieces of literature, specifying step-by-step action sequences and concrete state changes:
 ```markdown
 # Chapter 1: The Gathering Mist
 
 ## Chapter Summary
-Jonathan reaches Blackwood Ridge and rendezvous with Rowan under cover of darkness.
+Jonathan reaches Blackwood Ridge and rendezvous with Rowan under cover of darkness to secure the crypt key.
+
+## Chapter Instructions
+Atmospheric, steady pacing; heighten cold wind and rusted iron textures; keep dialogue sparse and guarded.
 
 ## Beats
 
 ### Beat 1: The Ascent
 - **Characters:** Jonathan Blackwood
 - **Location:** Blackwood Ridge Crest
-- **Action:** Jonathan struggles up the frozen rocky incline as dusk turns to night.
-- **Goal/Hook:** He spots a lantern signal flashing from the crypt entrance below.
+- **Action:** 1. Jonathan navigates the frozen rocky incline as dusk turns to night. 2. He spots a patrol torchline across the gorge and takes cover behind the jagged granite outcrop. 3. He counts three sentries before advancing.
+- **Goal/Hook:** Reach the vantage point undetected; he spots Rowan's lantern signal flashing from the crypt entrance below.
+- **Instructions:** Emphasize the bitter frost against his knuckles and the crunch of shale underfoot.
 
 ### Beat 2: The Meeting
 - **Characters:** Jonathan Blackwood, Rowan Cole
@@ -299,10 +319,20 @@ When writing Beat $N$:
 
 #### 3. Pre-Review Continuity Critic Audit
 Before presenting drafted prose to the author, Quillbot runs an automated audit pass using `openai/gpt-oss-20b` (`CONTINUITY_CRITIC_SYSTEM_PROMPT`):
-- Audits drafted prose against Tier 1 canon (names, physical traits, dead/alive status).
+- Audits drafted prose against Tier 1 canon (names, physical traits, moral alignment, dead/alive status).
+- Audits narrative progression and anti-stalling (`scene_stalling`): ensures the beat does not stall the story by repeating identical morning/scenic routines already performed in prior beats.
 - Verifies beat boundaries (ensuring the model did not rush ahead into future beats).
 - Validates immediate scene physics (lighting, weather, held items, injuries).
 - If issues are flagged, the CLI displays the quote, contradiction, and suggested fix, and adds a dedicated **`[F]ix`** hotkey to the review menu. Pressing `F` automatically feeds the critic's instructions back into the regenerator.
+
+#### 4. 4-Tier AI Creativity & Expressiveness Engine (`off`, `low`, `medium`, `high`)
+Configurable in `.quillbot/config.json` (`generation.creativity`) and selected during the setup wizard.
+- **Strict Zero-Invention Rule (All Levels):** At ALL levels (`off`, `low`, `medium`, `high`), creating new details, unmentioned characters, plot events, unrequested twists, physical contradictions, or unmentioned props is STRICTLY FORBIDDEN. Creativity tiers govern ONLY the stylistic expressiveness and prose rendering of author-dictated material.
+- **`off` (Strict Fidelity & Literal Execution):** Zero extrapolation. Direct literal translation adhering entirely to what was told by the author without creating even a single detail. Temperatures: Plan 0.1, Write 0.3, Summaries 0.1. Reasoning: `low`. Max Tokens: 2,048.
+- **`low` (Guided Fidelity & Clean Prose):** Zero invented details. Clean, unadorned prose with minimal physical connective tissue. Temperatures: Plan 0.3, Write 0.5, Summaries 0.15. Reasoning: `low`. Max Tokens: 3,072.
+- **`medium` (Balanced Collaboration - Paid Tier Exclusive):** Zero invented details. Richer sensory cadence, textured atmosphere, and emotional subtext strictly grounded in the author's specified scene. Temperatures: Plan 0.6, Write 0.75, Summaries 0.2. Reasoning: `medium`. Max Tokens: 4,096.
+- **`high` (Lyrical & Expansive - Paid Tier Exclusive):** Zero invented details. Vivid, lyrical prose rendering with maximum character interiority and atmospheric depth without manufacturing any plot points. Temperatures: Plan 0.85, Write 0.95, Summaries 0.3. Reasoning: `high`. Max Tokens: 6,144.
+- **Paid Plan Gating:** `medium` and `high` creativity and reasoning are locked to paid plan users (`apiTier === 'paid' || apiTier === 'developer'`). Free tier users are restricted in the setup wizard and auto-clamped to `low` in `loadConfig`.
 
 ---
 
@@ -377,6 +407,7 @@ Quillbot features an interactive dropdown menu. Typing `/` anywhere in the REPL 
     "rrfK": 60
   },
   "generation": {
+    "creativity": "medium",
     "temperaturePlan": 0.6,
     "temperatureWrite": 0.75,
     "continuityTailWords": 350,
@@ -424,7 +455,7 @@ Quillbot includes an automated test suite executed via Node's native test runner
 npm test
 ```
 
-### Test Suite Structure (45 Passing Tests)
+### Test Suite Structure (89 Passing Tests)
 - [`test/config.test.js`](file:///f:/quillbot/test/config.test.js):
   - State manager persistence and defaults.
   - Directory scaffolding and instructions generation.
@@ -450,6 +481,22 @@ npm test
   - Story Bible file listing, creation, and non-destructive AI editing.
   - Single beat planning and `/plan <ch> add` workflow.
   - REPL slash-menu interception preventing speed typing freezes.
+- [`test/v4quota.test.js`](file:///f:/quillbot/test/v4quota.test.js):
+  - Quota manager tracking, free/paid tier gating, and 429 retry handling.
+- [`test/v6condensedFlow.test.js`](file:///f:/quillbot/test/v6condensedFlow.test.js):
+  - `.condensed/` layout, beat plan condensation, and story-so-far progression context.
+- [`test/v7auditFixes.test.js`](file:///f:/quillbot/test/v7auditFixes.test.js):
+  - Architectural audit fixes, additive rerank bonuses, and KV-prefix ordering.
+- [`test/v8queryRouting.test.js`](file:///f:/quillbot/test/v8queryRouting.test.js):
+  - `/bible` vs general query routing, readable streaming, and scoped RAG queries.
+- [`test/v9integration.test.js`](file:///f:/quillbot/test/v9integration.test.js):
+  - Non-mocked HTTP `GroqClient`, live Ollama `embeddinggemma`, LanceDB, ONNX reranker, watcher, and safety integration tests.
+- [`test/v11antiHallucination.test.js`](file:///f:/quillbot/test/v11antiHallucination.test.js):
+  - Permanent strict fidelity directive (`creativity: 'off'`) and invariant temperatures (0.1 plan, 0.3 write, 0.1 summary).
+  - Reasoning effort configuration (`low`, `medium`, `high`), paid-tier gating, and scene baseline `medium` reasoning (4096 tokens).
+  - Mandatory dialogue speaker attribution constraints in planning and writing prompts.
+  - 120B high-reasoning open clarifying questions engine for `/init` and `/plan`.
+  - LanceDB corruption self-healing on power failures and manifest mismatch.
 - [`test/workflows.test.js`](file:///f:/quillbot/test/workflows.test.js):
   - Multi-paragraph beat parsing without tables.
   - Verbatim continuity window tail-word extraction.

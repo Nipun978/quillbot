@@ -107,9 +107,7 @@ export async function pullOllamaModel(baseUrl = 'http://127.0.0.1:11434', model 
  * starts `ollama serve` automatically in background and waits for it.
  */
 export async function ensureOllamaRunning({
-  baseUrl = 'http://127.0.0.1:11434',
-  model = 'embeddinggemma',
-  autoPull = true
+  baseUrl = 'http://127.0.0.1:11434'
 } = {}) {
   const cleanBase = baseUrl.replace(/\/$/, '');
   const isUp = await probeOllama(cleanBase, 2000);

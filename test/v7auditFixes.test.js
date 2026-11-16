@@ -157,11 +157,11 @@ test('Issue 7: reranker applies soft additive tie-breaker instead of multiplicat
   });
 
   // Pure sigmoid score = 0.5
-  // Tier 1 bonus = +0.02 -> 0.52
-  // Tier 2 bonus = +0.01 -> 0.51
-  // Tier 3 bonus = +0.00 -> 0.50
-  assert.equal(reranked[0].id, 'tier1_doc');
-  assert.equal(reranked[1].id, 'tier2_doc');
+  // Tier 2 bonus = +0.02 -> 0.52 (Past Chapter manuscript progress has highest authority)
+  // Tier 1 bonus = +0.01 -> 0.51 (Story Bible global baseline canon)
+  // Tier 3 bonus = +0.00 -> 0.50 (Archived conversation notes)
+  assert.equal(reranked[0].id, 'tier2_doc');
+  assert.equal(reranked[1].id, 'tier1_doc');
   assert.equal(reranked[2].id, 'tier3_doc');
 
   assert.ok(Math.abs(reranked[0].rerankScore - 0.52) < 0.001);

@@ -84,8 +84,8 @@ test('vectorStore handles LanceDB table, FTS and RRF search', async () => {
     });
 
     assert.ok(results.length > 0);
-    // Story bible (tier 1) has 1.25x boost over chapter (tier 2: 1.10x)
-    assert.equal(results[0].authority_tier, 1);
+    // Manuscript chapter progress (tier 2: 1.10x) has higher precedence over story bible baseline (tier 1: 1.05x)
+    assert.equal(results[0].authority_tier, 2);
   } finally {
     await store.close();
     try {

@@ -6,15 +6,17 @@ import {
   PLAN_CHAPTER_SYSTEM_PROMPT,
   PLAN_CHAPTER_HEADER_SYSTEM_PROMPT,
   PLAN_SINGLE_BEAT_SYSTEM_PROMPT,
+  GENERATE_BEAT_QUESTIONS_SYSTEM_PROMPT,
   buildHierarchyContext,
-  buildStoryBibleContext
+  buildStoryBibleContext,
+  buildCreativityDirective
 } from '../llm/prompts.js';
-import { loadInstructions } from '../config/configManager.js';
+import { loadInstructions, getCreativityTemperatures, getCreativityExecutionProfile, getExecutionProfile } from '../config/configManager.js';
 import { setActiveBeat, loadState } from '../config/stateManager.js';
 import { createBackup } from '../config/backupManager.js';
 import { parseBeatsFromPlan, parseChapterPlanHeader } from './writeChapter.js';
 import { createSpinner, printMarkdown } from '../ui/renderer.js';
-import { promptReviewWorkflow } from '../ui/reviewPrompt.js';
+import { promptReviewWorkflow, openInEditor } from '../ui/reviewPrompt.js';
 import { syncAllFiles } from '../rag/fileSync.js';
 import { ensureStdinRaw } from '../ui/ttyManager.js';
 import {
@@ -28,6 +30,70 @@ import {
 
 export function padChapter(num) {
   return String(num).padStart(2, '0');
+}
+
+function assemblePlanningStyle(config = {}) {
+  const enhanced = (config.enhancedWritingStyle || '').trim();
+  const core = (config.writingStyle || '').trim();
+  if (enhanced && core && core !== enhanced) {
+    return `${enhanced}\n\nAuthor Core Preferences: ${core}`;
+  }
+  return enhanced || core || '';
+}
+
+async function retrieveScopedPlanContext({
+  searchQuery = '',
+  embedder,
+  vectorStore,
+  reranker,
+  topKBible = 5,
+  topKSupp = 3
+}) {
+  if (!searchQuery || !searchQuery.trim() || !embedder || !vectorStore || !reranker) {
+    return { tier1: [], tier2: [], tier3: [] };
+  }
+  try {
+    const queryVector = await embedder.embedQuery(searchQuery);
+    const bibleCandidates = await vectorStore.hybridSearch({
+      queryText: searchQuery,
+      queryVector,
+      vectorTopK: 15,
+      bm25TopK: 15,
+      sourceTypes: ['story-bible'],
+      authorityTiers: [1]
+    });
+    const rerankedBible = await reranker.rerank({
+      queryText: searchQuery,
+      candidates: bibleCandidates,
+      topK: topKBible
+    });
+    const tier1 = rerankedBible.filter((c) => Number(c.authority_tier) === 1);
+
+    let tier2 = [];
+    let tier3 = [];
+    if (topKSupp > 0) {
+      const suppCandidates = await vectorStore.hybridSearch({
+        queryText: searchQuery,
+        queryVector,
+        vectorTopK: 10,
+        bm25TopK: 10,
+        sourceTypes: ['chapter', 'chapter-summary', 'condensed-story-so-far', 'conversation'],
+        authorityTiers: [2, 3]
+      });
+      if (suppCandidates && suppCandidates.length > 0) {
+        const rerankedSupp = await reranker.rerank({
+          queryText: searchQuery,
+          candidates: suppCandidates,
+          topK: topKSupp
+        });
+        tier2 = rerankedSupp.filter((c) => Number(c.authority_tier) === 2);
+        tier3 = rerankedSupp.filter((c) => Number(c.authority_tier) === 3);
+      }
+    }
+    return { tier1, tier2, tier3 };
+  } catch {
+    return { tier1: [], tier2: [], tier3: [] };
+  }
 }
 
 export async function loadPastChapterSummaries(cwd = process.cwd(), currentChapterNum = 1) {
@@ -77,12 +143,22 @@ export function updateBeatInPlan(planContent = '', targetBeatNum, newBeatBlock =
   }
 
   const preamble = planContent.slice(0, matches[0].index).trimEnd();
-  const beats = [];
+  const lastBeatStartIndex = matches[matches.length - 1].index;
+  const afterLastBeat = planContent.slice(lastBeatStartIndex);
 
+  let postscript = '';
+  const postSectionMatch = afterLastBeat.match(/\n(##\s+[^\n]+[\s\S]*)$/);
+  let lastBeatEndIndex = planContent.length;
+  if (postSectionMatch) {
+    postscript = postSectionMatch[1].trim();
+    lastBeatEndIndex = lastBeatStartIndex + postSectionMatch.index;
+  }
+
+  const beats = [];
   for (let i = 0; i < matches.length; i++) {
     const num = parseInt(matches[i][1], 10);
     const startIdx = matches[i].index;
-    const endIdx = i < matches.length - 1 ? matches[i + 1].index : planContent.length;
+    const endIdx = i < matches.length - 1 ? matches[i + 1].index : lastBeatEndIndex;
     const rawBlock = planContent.slice(startIdx, endIdx).trim();
     beats.push({ num, rawBlock });
   }
@@ -97,7 +173,9 @@ export function updateBeatInPlan(planContent = '', targetBeatNum, newBeatBlock =
   }
 
   const beatsText = beats.map((b) => b.rawBlock).join('\n\n');
-  return `${preamble}\n\n${beatsText}\n`;
+  return postscript
+    ? `${preamble}\n\n${beatsText}\n\n${postscript}\n`
+    : `${preamble}\n\n${beatsText}\n`;
 }
 
 /**
@@ -153,32 +231,18 @@ export async function runEditSingleBeatPlanWorkflow({
   const instructions = await loadInstructions(cwd);
   const pastSummaries = await loadPastChapterSummaries(cwd, chapterNum);
 
-  // Hybrid search
-  let relevantChunks = [];
   const searchQuery = [guidance, matchedBeat?.title, matchedBeat?.characters, matchedBeat?.location]
     .filter(Boolean)
     .join(' ') || `Chapter ${chapterNum} Beat ${targetNum}`;
 
-  try {
-    const queryVector = await embedder.embedQuery(searchQuery);
-    const candidates = await vectorStore.hybridSearch({
-      queryText: searchQuery,
-      queryVector,
-      vectorTopK: 15,
-      bm25TopK: 15
-    });
-    relevantChunks = await reranker.rerank({
-      queryText: searchQuery,
-      candidates,
-      topK: 6
-    });
-  } catch {}
+  const { tier1, tier2, tier3 } = await retrieveScopedPlanContext({
+    searchQuery,
+    embedder,
+    vectorStore,
+    reranker
+  });
 
   spinner.succeed('Context assembled.');
-
-  const tier1 = relevantChunks.filter((c) => Number(c.authority_tier) === 1);
-  const tier2 = relevantChunks.filter((c) => Number(c.authority_tier) === 2);
-  const tier3 = relevantChunks.filter((c) => Number(c.authority_tier) === 3);
 
   const hierarchyXml = buildHierarchyContext({
     instructions,
@@ -189,14 +253,17 @@ export async function runEditSingleBeatPlanWorkflow({
     rollingSummary: conversationMgr?.getRollingSummary ? conversationMgr.getRollingSummary() : ''
   });
 
-  const activeStyle = config.enhancedWritingStyle
-    ? `${config.enhancedWritingStyle}\n\nAuthor Core Preferences: ${config.writingStyle}`
-    : (config.writingStyle || '');
+  const activeStyle = assemblePlanningStyle(config);
+  const profile = getExecutionProfile('PLAN_BEAT', config);
+  const creativityDirective = buildCreativityDirective('off');
+  const planTemp = profile.temperaturePlan;
+  const reasoningEffort = profile.reasoningEffort;
+  const maxTokens = profile.maxTokens;
 
   // Beats context around this beat
   const otherBeatsContext = existingBeats
     .filter((b) => b.num !== targetNum)
-    .map((b) => `- Beat ${b.num} (${b.title}): ${b.action.slice(0, 150)}... [Goal/Hook: ${b.goalHook.slice(0, 100)}]`)
+    .map((b) => `- Beat ${b.num} (${b.title}): ${(b.beatOutline || b.action || '').slice(0, 150)}... [Author's Notes: ${(b.authorNotes || b.goalHook || '').slice(0, 100)}]`)
     .join('\n');
 
   let currentFeedback = '';
@@ -217,6 +284,8 @@ export async function runEditSingleBeatPlanWorkflow({
 ${activeStyle || '(Standard literary prose guidelines)'}
 </writing_style_and_pacing_rules>
 
+${creativityDirective}
+
 <chapter_context>
 Chapter ${chapterNum} Surrounding Beats:
 ${otherBeatsContext || '(No other beats planned yet)'}
@@ -228,20 +297,20 @@ ${matchedBeat.rawBlock}
 </current_beat_draft_to_revise>
 
 ### REVISION & IMPROVEMENT OBJECTIVE FOR BEAT ${targetNum}:
-${guidance || 'Improve the beat structure, deepen character motivation, sensory details, and dramatic tension while ensuring smooth scene transitions.'}
+${guidance || 'Improve the beat structure, deepen character motivation, and ensure smooth scene transitions.'}
 ` : `
 ### OBJECTIVE FOR NEW BEAT ${targetNum}:
 ${guidance || 'Plan an impactful new beat advancing the chapter story arc seamlessly.'}
 `}
 ${currentFeedback ? `\nRevision Feedback from previous attempt:\n${currentFeedback}` : ''}
 
-Generate the beat block for Beat ${targetNum} matching:
-### Beat ${targetNum}: [Title]
-- **Characters:** [Names]
-- **Location:** [Location]
-- **Action:** [Paragraph describing the beat events]
-- **Goal/Hook:** [Paragraph describing resolution and hook]
-- **Instructions:** [Short and to the point beat-level writing instructions]`;
+Generate the streamlined planning blueprint for Beat ${targetNum} matching:
+### Beat ${targetNum}: [Short Beat Title]
+- **Characters:** [Comma-separated character names matching Story Bible]
+- **Setting:** [Location and time/environment]
+- **Beat Outline:** [Concise, deterministic narrative progression containing ONLY details the author specified. Include author's verbatim dialogue in quotes. If the encounter is non-verbal/silent, state that no words are spoken—NEVER invent greetings, small-talk, or spoken dialogue not indicated by the author.]
+- **Author's Notes:** [Captures how and what the author wants to achieve: the emotional texture, subtext, and creative vision for this specific beat.]
+- **Beat Instructions:** [Concise beat-level prose directives: pacing, tone, and emotional distance. NO camera/screenplay jargon.]`;
 
       if (groqClient?.quotaManager) {
         const cd = config?.cooldownSeconds !== undefined ? config.cooldownSeconds : (process.stdin?.isTTY ? 45 : 0);
@@ -257,7 +326,10 @@ Generate the beat block for Beat ${targetNum} matching:
           { role: 'system', content: PLAN_SINGLE_BEAT_SYSTEM_PROMPT },
           { role: 'user', content: userPrompt }
         ],
-        temperature: config.generation?.temperaturePlan || 0.6,
+        temperature: planTemp,
+        maxTokens,
+        reasoningEffort,
+        sessionId: `plan_chapter_${chapterNum}_beat_${targetNum}`,
         workflow: 'PLAN_BEAT'
       });
 
@@ -534,29 +606,16 @@ export async function runPlanChapterWorkflow({
   const instructions = await loadInstructions(cwd);
   const pastSummaries = await loadPastChapterSummaries(cwd, chapterNum);
 
-  // Hybrid search for story bible elements matching guidance
-  let relevantChunks = [];
+  // Scoped Story Bible + supplemental RAG matching guidance
   const searchQuery = guidance.trim() || `Chapter ${chapterNum} plot progression and characters`;
-  try {
-    const queryVector = await embedder.embedQuery(searchQuery);
-    const candidates = await vectorStore.hybridSearch({
-      queryText: searchQuery,
-      queryVector,
-      vectorTopK: 15,
-      bm25TopK: 15
-    });
-    relevantChunks = await reranker.rerank({
-      queryText: searchQuery,
-      candidates,
-      topK: 6
-    });
-  } catch {}
+  const { tier1, tier2, tier3 } = await retrieveScopedPlanContext({
+    searchQuery,
+    embedder,
+    vectorStore,
+    reranker
+  });
 
   spinner.succeed('Context assembled.');
-
-  const tier1 = relevantChunks.filter((c) => Number(c.authority_tier) === 1);
-  const tier2 = relevantChunks.filter((c) => Number(c.authority_tier) === 2);
-  const tier3 = relevantChunks.filter((c) => Number(c.authority_tier) === 3);
 
   const hierarchyXml = buildHierarchyContext({
     instructions,
@@ -568,14 +627,19 @@ export async function runPlanChapterWorkflow({
   });
 
   let finalPlan = '';
+  const condensedBeatNums = new Set();
+  const profile = getExecutionProfile('PLAN_CHAPTER', config);
+  const creativityDirective = buildCreativityDirective('off');
+  const planTemp = profile.temperaturePlan;
+  const reasoningEffort = profile.reasoningEffort;
+  const maxTokens = profile.maxTokens;
 
   if (!isEditingFullPlan) {
     // REQUIREMENT 9: Planning a chapter without a specific target beat works beat-by-beat over multiple requests
     console.log(chalk.bold.cyan(`\n  Step 1: Planning Chapter ${chapterNum} Foundation (Summary & Instructions)...`));
 
-    const activeStyle = config.enhancedWritingStyle
-      ? config.enhancedWritingStyle.trim()
-      : (config.writingStyle || '');
+    const chapterAuthorOutline = guidance.trim();
+    const activeStyle = assemblePlanningStyle(config);
 
     // 1. Plan Chapter Header
     let headerAccepted = false;
@@ -587,13 +651,11 @@ export async function runPlanChapterWorkflow({
       try {
         const headerPrompt = `${hierarchyXml}
 
-<writing_style_rules>
-${activeStyle || '(Standard literary prose guidelines)'}
-</writing_style_rules>
-
 Target: Chapter ${chapterNum}
 Author Guidance / Core Conflict:
 ${guidance.trim() || '(Rely on Story Bible and previous chapter arc)'}
+
+${creativityDirective}
 ${headerFeedback ? `\nRevision Feedback:\n${headerFeedback}` : ''}
 
 Draft the Chapter Title, Chapter Summary (1-2 paragraphs), and Chapter Instructions (under 50 words) adhering strictly to the schema.`;
@@ -612,7 +674,11 @@ Draft the Chapter Title, Chapter Summary (1-2 paragraphs), and Chapter Instructi
             { role: 'system', content: PLAN_CHAPTER_HEADER_SYSTEM_PROMPT },
             { role: 'user', content: headerPrompt }
           ],
-          temperature: config.generation?.temperaturePlan || 0.6
+          temperature: planTemp,
+          maxTokens,
+          reasoningEffort,
+          sessionId: `plan_chapter_${chapterNum}`,
+          workflow: 'PLAN_CHAPTER_HEADER'
         });
 
         headerSpinner.succeed(`Drafted Chapter ${chapterNum} Foundation.`);
@@ -687,6 +753,25 @@ Draft the Chapter Title, Chapter Summary (1-2 paragraphs), and Chapter Instructi
         cwd
       });
 
+      // Re-query Story Bible canon specifically for this beat's guidance so characters/locations
+      // introduced mid-chapter don't miss their Tier 1 canon entries
+      let beatTier1 = tier1;
+      const perBeatQuery = [beatGuidance, chTitle, previousBeatPlan?.slice(0, 200)].filter(Boolean).join(' ');
+      if (perBeatQuery.trim()) {
+        const beatRag = await retrieveScopedPlanContext({
+          searchQuery: perBeatQuery,
+          embedder,
+          vectorStore,
+          reranker,
+          topKBible: 5,
+          topKSupp: 0
+        });
+        if (beatRag.tier1.length > 0) {
+          const seenIds = new Set(beatRag.tier1.map((c) => c.id));
+          beatTier1 = [...beatRag.tier1, ...tier1.filter((c) => !seenIds.has(c.id))].slice(0, 5);
+        }
+      }
+
       let beatPlanDraft = '';
       let beatAccepted = false;
       let beatFeedback = '';
@@ -694,7 +779,10 @@ Draft the Chapter Title, Chapter Summary (1-2 paragraphs), and Chapter Instructi
       while (!beatAccepted) {
         const beatSpinner = createSpinner(`Drafting Beat ${currentBeatNum} Plan...`).start();
         try {
-          const storyBibleXml = tier1.length > 0 ? buildStoryBibleContext(tier1) : '';
+          const storyBibleXml = beatTier1.length > 0 ? buildStoryBibleContext(beatTier1) : '';
+          const sysInstrXml = instructions && instructions.trim()
+            ? `<system_instructions>\n${instructions.trim()}\n</system_instructions>\n\n`
+            : '';
 
           const macroContinuityBlock = [
             storySoFar ? `### Story So Far (Chapters 1 to ${Math.max(1, chapterNum - 2)}):\n${storySoFar}` : '',
@@ -706,7 +794,7 @@ Draft the Chapter Title, Chapter Summary (1-2 paragraphs), and Chapter Instructi
             previousBeatPlan ? `### Immediate Preceding Beat Plan (Beat ${currentBeatNum - 1} Full Plan):\n${previousBeatPlan}` : ''
           ].filter(Boolean).join('\n\n') || '(First beat of this chapter)';
 
-          const beatUserPrompt = `${storyBibleXml ? `${storyBibleXml}\n\n` : ''}${macroContinuityBlock ? `<macro_story_continuity>\n${macroContinuityBlock}\n</macro_story_continuity>\n\n` : ''}<chapter_foundation>
+          const beatUserPrompt = `${sysInstrXml}${storyBibleXml ? `${storyBibleXml}\n\n` : ''}${macroContinuityBlock ? `<macro_story_continuity>\n${macroContinuityBlock}\n</macro_story_continuity>\n\n` : ''}${chapterAuthorOutline ? `<chapter_author_outline>\nFull Chapter Arc & Milestones specified by Author:\n${chapterAuthorOutline}\n</chapter_author_outline>\n\n` : ''}<chapter_foundation>
 Chapter Title: ${chTitle || `Chapter ${chapterNum}`}
 Chapter Summary: ${chSummary}
 ${chInstructions ? `Chapter Instructions: ${chInstructions}` : ''}
@@ -716,21 +804,19 @@ ${chInstructions ? `Chapter Instructions: ${chInstructions}` : ''}
 ${beatContextBlock}
 </chapter_beats_context>
 
-<writing_style_rules>
-${activeStyle || '(Standard literary prose guidelines)'}
-</writing_style_rules>
+${creativityDirective}
 
 ### OBJECTIVE FOR BEAT ${currentBeatNum}:
-${beatGuidance.trim() || 'Advance the chapter narrative arc with rich character tension and sensory specifics.'}
+${beatGuidance.trim() || (chapterAuthorOutline ? `Execute Beat ${currentBeatNum} precisely as specified in <chapter_author_outline>. Obey the exact sequence, verbatim dialogue, and intentional silences.` : 'Advance the chapter narrative arc with concrete character tension and pacing.')}
 ${beatFeedback ? `\nRevision Feedback from previous attempt:\n${beatFeedback}` : ''}
 
-Generate the beat block for Beat ${currentBeatNum} matching:
-### Beat ${currentBeatNum}: [Title]
-- **Characters:** [Names]
-- **Location:** [Location]
-- **Action:** [Paragraph describing the beat events]
-- **Goal/Hook:** [Paragraph describing resolution and hook]
-- **Instructions:** [Short and to the point beat-level writing instructions]`;
+Generate the streamlined planning blueprint for Beat ${currentBeatNum} matching:
+### Beat ${currentBeatNum}: [Short Beat Title]
+- **Characters:** [Comma-separated character names matching Story Bible]
+- **Setting:** [Location and time/environment]
+- **Beat Outline:** [Concise, deterministic narrative progression containing ONLY details the author specified. Include author's verbatim dialogue in quotes. If the encounter is non-verbal/silent, state that no words are spoken—NEVER invent greetings, small-talk, or spoken dialogue not indicated by the author.]
+- **Author's Notes:** [Captures how and what the author wants to achieve: the emotional texture, subtext, and creative vision for this specific beat.]
+- **Beat Instructions:** [Concise beat-level prose directives: pacing, tone, and emotional distance. NO camera/screenplay jargon.]`;
 
           if (groqClient?.quotaManager) {
             const cd = config?.cooldownSeconds !== undefined ? config.cooldownSeconds : (process.stdin?.isTTY ? 45 : 0);
@@ -746,7 +832,11 @@ Generate the beat block for Beat ${currentBeatNum} matching:
               { role: 'system', content: PLAN_SINGLE_BEAT_SYSTEM_PROMPT },
               { role: 'user', content: beatUserPrompt }
             ],
-            temperature: config.generation?.temperaturePlan || 0.6
+            temperature: planTemp,
+            maxTokens,
+            reasoningEffort,
+            sessionId: `plan_chapter_${chapterNum}_beat_${currentBeatNum}`,
+            workflow: 'PLAN_CHAPTER_BEAT'
           });
 
           beatSpinner.succeed(`Drafted Beat ${currentBeatNum} Plan.`);
@@ -793,6 +883,7 @@ Generate the beat block for Beat ${currentBeatNum} matching:
               cwd,
               config
             });
+            condensedBeatNums.add(currentBeatNum);
             condenseSpinner.succeed(`Beat ${currentBeatNum} plan condensed into .condensed/chapters/chapter-${padded}/plan.md`);
           } catch (err) {
             condenseSpinner.fail(`Failed to condense Beat ${currentBeatNum} plan: ${err.message}`);
@@ -834,6 +925,9 @@ Generate the beat block for Beat ${currentBeatNum} matching:
         } else if (beatReview.action === 'retry') {
           beatFeedback = beatReview.feedback || 'Please refine the action, character motivation, and scene instructions.';
         } else if (beatReview.action === 'pause') {
+          try {
+            await syncAllFiles({ cwd, vectorStore, embedder, config });
+          } catch {}
           console.log(chalk.yellow(`\nPlanning paused at Beat ${currentBeatNum}. Progress saved in project/chapter-${padded}/plan.md. Resume with /plan ${chapterNum}`));
           return;
         }
@@ -850,9 +944,7 @@ Generate the beat block for Beat ${currentBeatNum} matching:
       const planSpinner = createSpinner(`Revising Beat Plan for Chapter ${chapterNum}...`).start();
 
       try {
-        const activeStyle = config.enhancedWritingStyle
-          ? `${config.enhancedWritingStyle}\n\nAuthor Core Preferences: ${config.writingStyle}`
-          : (config.writingStyle || '');
+        const activeStyle = assemblePlanningStyle(config);
 
         const userPrompt = `${hierarchyXml}
 
@@ -860,13 +952,15 @@ Generate the beat block for Beat ${currentBeatNum} matching:
 Author's Writing Style & Tone Specification:
 ${activeStyle || '(Standard literary prose guidelines)'}
 
-CRITICAL: Embody this exact tone, psychological depth, and stylistic pacing in every beat's Action and Goal/Hook description.
+CRITICAL: Embody the author's intended tone, emotional restraint, and stylistic pacing in every beat's Beat Outline and Author's Notes.
 </writing_style_and_pacing_rules>
 
 Target: Chapter ${chapterNum}
 
 ### EXISTING CHAPTER ${chapterNum} PLAN (FOR REVISION & IMPROVEMENT):
 ${existingPlan.trim()}
+
+${creativityDirective}
 
 ### AUTHOR'S REVISION GUIDANCE & EDITORIAL DIRECTION:
 ${guidance.trim() || 'Refine the dramatic arc, heighten emotional stakes, improve beat pacing, and ensure seamless transitions between beats.'}
@@ -876,7 +970,7 @@ CRITICAL REVISION INSTRUCTIONS:
 You are editing and improving the existing Chapter ${chapterNum} plan above according to the author's guidance.
 - Retain strong beats, characters, and established events from the existing plan.
 - Address the author's revision guidance.
-- Output the complete, revised Chapter ${chapterNum} plan matching the strict Beat schema.`;
+- Output the complete, revised Chapter ${chapterNum} plan matching the streamlined Beat blueprint schema (Characters, Setting, Beat Outline, Author's Notes, Beat Instructions).`;
 
         if (groqClient?.quotaManager) {
           const cd = config?.cooldownSeconds !== undefined ? config.cooldownSeconds : (process.stdin?.isTTY ? 45 : 0);
@@ -892,7 +986,10 @@ You are editing and improving the existing Chapter ${chapterNum} plan above acco
             { role: 'system', content: PLAN_CHAPTER_SYSTEM_PROMPT },
             { role: 'user', content: userPrompt }
           ],
-          temperature: config.generation?.temperaturePlan || 0.6,
+          temperature: planTemp,
+          maxTokens,
+          reasoningEffort,
+          sessionId: `plan_chapter_${chapterNum}`,
           workflow: 'PLAN_CHAPTER'
         });
 
@@ -934,6 +1031,51 @@ You are editing and improving the existing Chapter ${chapterNum} plan above acco
     }
   }
 
+  // Requirement: 120B Open Questions at high reasoning upon finishing chapter plan
+  if (config.groqApiKey && !finalPlan.includes('## Author Clarifications & Beat Directives')) {
+    console.log(chalk.bold.cyan('\n  Formulating beat clarifying questions (120B model)...'));
+    const questionsProfile = getExecutionProfile('PLAN_BEAT_QUESTIONS', config);
+    const qSpinner = createSpinner('Generating open clarifying questions per beat...').start();
+    let beatQuestionsDraft = '';
+    try {
+      const qPrompt = `Project Title: ${config.projectTitle || 'Novel'}
+Target: Chapter ${chapterNum} Plan
+
+${finalPlan.trim()}`;
+
+      beatQuestionsDraft = await groqClient.chatCompletion({
+        model: 'large',
+        messages: [
+          { role: 'system', content: GENERATE_BEAT_QUESTIONS_SYSTEM_PROMPT },
+          { role: 'user', content: qPrompt }
+        ],
+        temperature: questionsProfile.temperaturePlan,
+        maxTokens: questionsProfile.maxTokens,
+        reasoningEffort: questionsProfile.reasoningEffort,
+        sessionId: `plan_questions_chapter_${chapterNum}`,
+        workflow: 'PLAN_BEAT_QUESTIONS'
+      });
+      qSpinner.succeed('Beat clarifying questions generated.');
+    } catch (err) {
+      qSpinner.warn(`Skipping beat questions generation: ${err.message}`);
+    }
+
+    if (beatQuestionsDraft && beatQuestionsDraft.trim()) {
+      console.log(chalk.cyan('Opening questions in your editor. Add your beat-specific directives/answers, then save and close.'));
+      try {
+        const answeredQuestions = await openInEditor(beatQuestionsDraft, config.editor);
+        if (answeredQuestions && answeredQuestions.trim() && answeredQuestions.trim() !== beatQuestionsDraft.trim()) {
+          finalPlan = `${finalPlan.trim()}\n\n## Author Clarifications & Beat Directives\n\n${answeredQuestions.trim()}\n`;
+          console.log(chalk.green('✓ Author beat clarifications appended to chapter plan.'));
+        } else {
+          console.log(chalk.dim('No additional beat clarifications entered.'));
+        }
+      } catch (err) {
+        console.log(chalk.yellow(`Could not open editor (${err.message}). Continuing without beat clarifications.`));
+      }
+    }
+  }
+
   // Save plan.md with backup
   await fs.mkdir(chapterDir, { recursive: true });
   if (hasExistingPlan) {
@@ -942,24 +1084,27 @@ You are editing and improving the existing Chapter ${chapterNum} plan above acco
   await fs.writeFile(planFile, finalPlan, 'utf8');
   await setActiveBeat(chapterNum, 1, cwd);
 
-  // Condense chapter plan and beats into .condensed/chapters/chapter-XX/plan.md
+  // Condense any chapter beats into .condensed/chapters/chapter-XX/plan.md not already condensed during the loop
   const finalBeats = parseBeatsFromPlan(finalPlan);
-  const condenseSpinner = createSpinner(`Syncing all ${finalBeats.length} beats into .condensed/chapters/chapter-${padded}/plan.md...`).start();
-  try {
-    for (const b of finalBeats) {
-      await saveCondensedBeatPlan({
-        chapterNum,
-        beatNum: b.num,
-        beatTitle: b.title,
-        planText: b.rawBlock,
-        groqClient,
-        cwd,
-        config
-      });
+  const beatsToCondense = finalBeats.filter((b) => !condensedBeatNums.has(b.num));
+  if (beatsToCondense.length > 0) {
+    const condenseSpinner = createSpinner(`Syncing ${beatsToCondense.length} beat(s) into .condensed/chapters/chapter-${padded}/plan.md...`).start();
+    try {
+      for (const b of beatsToCondense) {
+        await saveCondensedBeatPlan({
+          chapterNum,
+          beatNum: b.num,
+          beatTitle: b.title,
+          planText: b.rawBlock,
+          groqClient,
+          cwd,
+          config
+        });
+      }
+      condenseSpinner.succeed(`Synced ${beatsToCondense.length} beat(s) into .condensed/chapters/chapter-${padded}/plan.md`);
+    } catch (err) {
+      condenseSpinner.fail(`Failed to sync condensed beats: ${err.message}`);
     }
-    condenseSpinner.succeed(`All ${finalBeats.length} beats condensed into .condensed/chapters/chapter-${padded}/plan.md`);
-  } catch (err) {
-    condenseSpinner.fail(`Failed to sync condensed beats: ${err.message}`);
   }
 
   console.log(chalk.green(`\nSaved plan to project/chapter-${padded}/plan.md`));

@@ -89,69 +89,85 @@ export async function syncAllFiles({
   cwd = process.cwd(),
   vectorStore,
   embedder,
-  config = {}
+  config = {},
+  force = false
 }) {
-  const state = await loadState(cwd);
-  const currentHashes = state.fileHashes || {};
-  const diskFiles = await getTrackedFiles(cwd);
-  const diskFileSet = new Set(diskFiles);
+  try {
+    const state = await loadState(cwd);
+    let currentHashes = force ? {} : (state.fileHashes || {});
+    const diskFiles = await getTrackedFiles(cwd);
+    const diskFileSet = new Set(diskFiles);
 
-  let hasChanges = false;
-  let indexedCount = 0;
-  let deletedCount = 0;
+    let hasChanges = force;
+    let indexedCount = 0;
+    let deletedCount = 0;
 
-  // 1. Detect deleted files
-  for (const recordedPath of Object.keys(currentHashes)) {
-    if (!diskFileSet.has(recordedPath)) {
-      await vectorStore.deleteBySourcePath(recordedPath);
-      delete currentHashes[recordedPath];
-      hasChanges = true;
-      deletedCount++;
+    // 1. Detect deleted files (if not forcing a clean rebuild)
+    if (!force) {
+      for (const recordedPath of Object.keys(currentHashes)) {
+        if (!diskFileSet.has(recordedPath)) {
+          await vectorStore.deleteBySourcePath(recordedPath);
+          delete currentHashes[recordedPath];
+          hasChanges = true;
+          deletedCount++;
+        }
+      }
     }
-  }
 
-  // 2. Detect new or modified files
-  for (const relPath of diskFiles) {
-    const fullPath = path.join(cwd, relPath);
-    const hash = await computeFileHash(fullPath);
-    if (!hash) continue;
+    // 2. Detect new or modified files
+    for (const relPath of diskFiles) {
+      const fullPath = path.join(cwd, relPath);
+      const hash = await computeFileHash(fullPath);
+      if (!hash) continue;
 
-    if (currentHashes[relPath] !== hash) {
-      // Re-index this file
-      await vectorStore.deleteBySourcePath(relPath);
+      if (force || currentHashes[relPath] !== hash) {
+        // Re-index this file
+        await vectorStore.deleteBySourcePath(relPath);
 
-      const content = await fs.readFile(fullPath, 'utf8');
-      const chunks = chunkDocument({
-        relativePath: relPath,
-        content,
-        chunkSizeTokens: config.rag?.chunkSizeTokens || 400,
-        chunkOverlapTokens: config.rag?.chunkOverlapTokens || 60
-      });
-
-      if (chunks.length > 0) {
-        const textsToEmbed = chunks.map((c) => c.text);
-        const embeddings = await embedder.embedTexts(textsToEmbed);
-
-        chunks.forEach((c, idx) => {
-          c.vector = embeddings[idx];
+        const content = await fs.readFile(fullPath, 'utf8');
+        const chunks = chunkDocument({
+          relativePath: relPath,
+          content,
+          chunkSizeTokens: config.rag?.chunkSizeTokens || 400,
+          chunkOverlapTokens: config.rag?.chunkOverlapTokens || 60
         });
 
-        await vectorStore.addChunks(chunks);
-        indexedCount += chunks.length;
+        if (chunks.length > 0) {
+          // Embed semantic content (section title + raw body) without noisy [File: ... | Type: ... | Tier: ...] header tags
+          const textsToEmbed = chunks.map((c) => {
+            const body = c.raw_text || c.text;
+            return c.section_title ? `${c.section_title}\n${body}` : body;
+          });
+          const embeddings = await embedder.embedTexts(textsToEmbed);
+
+          chunks.forEach((c, idx) => {
+            c.vector = embeddings[idx];
+          });
+
+          await vectorStore.addChunks(chunks);
+          indexedCount += chunks.length;
+        }
+
+        currentHashes[relPath] = hash;
+        hasChanges = true;
       }
-
-      currentHashes[relPath] = hash;
-      hasChanges = true;
     }
-  }
 
-  if (hasChanges) {
-    state.fileHashes = currentHashes;
-    await saveState(state, cwd);
-    await vectorStore.rebuildFtsIndex();
-  }
+    if (hasChanges) {
+      state.fileHashes = currentHashes;
+      await saveState(state, cwd);
+      await vectorStore.rebuildFtsIndex();
+    }
 
-  return { hasChanges, indexedCount, deletedCount };
+    return { hasChanges, indexedCount, deletedCount };
+  } catch (err) {
+    if (vectorStore && typeof vectorStore._isCorruptError === 'function' && vectorStore._isCorruptError(err)) {
+      console.warn('[fileSync] LanceDB corruption detected during file sync. Auto-recovering index and re-syncing...');
+      await vectorStore.repairCorruptedIndex();
+      return await syncAllFiles({ cwd, vectorStore, embedder, config, force: true });
+    }
+    throw err;
+  }
 }
 
 export function startFileWatcher({
@@ -161,10 +177,19 @@ export function startFileWatcher({
   config = {},
   onSync = () => {}
 }) {
-  const bibleDir = path.join(cwd, 'story-bible');
+  const watchTargets = [
+    path.join(cwd, 'story-bible'),
+    path.join(cwd, 'project'),
+    path.join(cwd, '.condensed'),
+    path.join(cwd, 'conversations', 'archive')
+  ];
   let debounceTimeout = null;
 
-  const triggerSync = () => {
+  const triggerSync = (changedPath = '') => {
+    if (changedPath) {
+      const ext = path.extname(changedPath).toLowerCase();
+      if (ext !== '.md' && ext !== '.txt') return;
+    }
     if (debounceTimeout) clearTimeout(debounceTimeout);
     debounceTimeout = setTimeout(async () => {
       try {
@@ -178,8 +203,16 @@ export function startFileWatcher({
     }, 1000);
   };
 
-  const watcher = chokidar.watch(bibleDir, {
-    ignored: /(^|[\/\\])\../, // ignore dotfiles
+  const watcher = chokidar.watch(watchTargets, {
+    ignored: (filePath) => {
+      const normalized = filePath.replace(/\\/g, '/');
+      return (
+        normalized.includes('/.quillbot') ||
+        normalized.includes('/.git') ||
+        normalized.includes('/node_modules')
+      );
+    },
+    ignoreInitial: true,
     persistent: true
   });
 

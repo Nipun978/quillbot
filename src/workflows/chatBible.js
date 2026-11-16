@@ -12,6 +12,7 @@ import {
   buildHierarchyContext
 } from '../llm/prompts.js';
 import { loadInstructions } from '../config/configManager.js';
+import { loadState } from '../config/stateManager.js';
 import { createBackup } from '../config/backupManager.js';
 import { createSpinner, printMarkdown, createReadableStreamPrinter } from '../ui/renderer.js';
 import { promptReviewWorkflow, openInEditor } from '../ui/reviewPrompt.js';
@@ -23,6 +24,120 @@ Formatting & Readability Rules:
 - Write in a helpful, clear, easy-to-read conversational style.
 - Do NOT use raw markdown syntax: no # headings, no ** or __ bold/italic markers, no backticks, and no markdown tables.
 - Use short paragraphs, plain section labels (for example, "Key Details:" or "Next Steps:"), and simple "- " bullet points with blank lines between sections.`;
+
+/**
+ * Returns true when user input is a short conversational greeting or acknowledgement
+ * that does not warrant RAG query improvisation or Story Bible retrieval.
+ */
+export function isTrivialGreeting(text = '') {
+  return /^(hi|hello|hey|yo|hiya|good\s+(morning|afternoon|evening)|thanks|thank\s+you|thx|ok|okay|cool|great|bye|goodbye)[!.,?\s]*$/i.test(
+    String(text || '').trim()
+  );
+}
+
+/**
+ * Strips raw markdown formatting markers so saved conversation history stays clean plain text.
+ */
+export function stripMarkdownForStorage(text = '') {
+  return String(text || '')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/\*\*(.+?)\*\*/g, '$1')
+    .replace(/__(.+?)__/g, '$1')
+    .replace(/`{1,3}([^`]+)`{1,3}/g, '$1')
+    .trim();
+}
+
+/**
+ * Loads deterministic on-disk manuscript progress (.condensed/story-so-far.md, chapter summaries,
+ * written beat counts, and state.json active cursor) so progress queries never confuse
+ * Story Bible outlines with actually written manuscript chapters.
+ */
+async function loadWrittenProgressSummary(cwd) {
+  const parts = [];
+  let hasWrittenContent = false;
+
+  try {
+    const storySoFarPath = path.join(cwd, '.condensed', 'story-so-far.md');
+    const storySoFar = (await fs.readFile(storySoFarPath, 'utf8')).trim();
+    if (storySoFar) {
+      hasWrittenContent = true;
+      parts.push(`Story So Far (.condensed/story-so-far.md):\n${storySoFar}`);
+    }
+  } catch {
+    // Not created yet
+  }
+
+  try {
+    const state = await loadState(cwd);
+    if (state?.activeChapter) {
+      parts.push(`Current Workspace Cursor: Chapter ${state.activeChapter}${state.activeBeat ? `, Beat ${state.activeBeat}` : ''}`);
+    }
+  } catch {
+    // Ignore missing state
+  }
+
+  try {
+    const projectDir = path.join(cwd, 'project');
+    const entries = await fs.readdir(projectDir, { withFileTypes: true });
+    const chapterDirs = entries
+      .filter((e) => e.isDirectory() && /^chapter-\d+$/i.test(e.name))
+      .map((e) => e.name)
+      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+
+    const chapterStatuses = [];
+    for (const dirName of chapterDirs) {
+      const chDir = path.join(projectDir, dirName);
+      let hasPlan = false;
+      let writtenBeats = 0;
+      let summaryText = '';
+
+      try {
+        await fs.access(path.join(chDir, 'plan.md'));
+        hasPlan = true;
+      } catch {
+        // no plan
+      }
+
+      try {
+        const chText = await fs.readFile(path.join(chDir, 'chapter.md'), 'utf8');
+        const beatMatches = chText.match(/<!--\s*BEAT\s+\d+\s*-->/gi);
+        writtenBeats = beatMatches ? beatMatches.length : (chText.trim() ? 1 : 0);
+        if (writtenBeats > 0) hasWrittenContent = true;
+      } catch {
+        // no written prose yet
+      }
+
+      try {
+        summaryText = (await fs.readFile(path.join(chDir, 'summary.md'), 'utf8')).trim();
+        if (summaryText) hasWrittenContent = true;
+      } catch {
+        // no chapter summary yet
+      }
+
+      chapterStatuses.push(
+        `- ${dirName}: planned=${hasPlan ? 'yes' : 'no'}, written_beats=${writtenBeats}, completed_summary=${summaryText ? 'yes' : 'no'}`
+      );
+      if (summaryText) {
+        parts.push(`${dirName}/summary.md:\n${summaryText}`);
+      }
+    }
+
+    if (chapterStatuses.length > 0) {
+      parts.unshift(`Written Manuscript Status:\n${chapterStatuses.join('\n')}`);
+    } else if (!hasWrittenContent) {
+      parts.unshift('Written Manuscript Status: No chapters have been planned or written in project/ yet.');
+    }
+  } catch {
+    if (!hasWrittenContent) {
+      parts.push('Written Manuscript Status: No chapters have been written in project/ yet.');
+    }
+  }
+
+  return {
+    text: parts.join('\n\n'),
+    hasWrittenContent
+  };
+}
 
 /**
  * Shared Hybrid RAG consultation pipeline supporting two scopes:
@@ -47,6 +162,40 @@ async function runRagConsultation({
   const recentTurns = conversationMgr?.getRecentTurns ? conversationMgr.getRecentTurns(4) : [];
   const rollingSummary = conversationMgr?.getRollingSummary ? conversationMgr.getRollingSummary() : '';
 
+  if (!isBibleScope && isTrivialGreeting(cleanQuery)) {
+    process.stdout.write(chalk.bold.magenta('\nQuillbot:\n'));
+    const printer = createReadableStreamPrinter();
+    let fullAnswer = '';
+    try {
+      fullAnswer = await groqClient.streamChatCompletion({
+        model: 'large',
+        messages: [
+          {
+            role: 'system',
+            content: `You are Quillbot, a friendly novel writing assistant. Reply warmly and concisely to the author's greeting or acknowledgement without dumping story spoilers or unsolicited project recaps. Offer brief slash-command next steps like /bible, /plan, or /write if appropriate.\n${READABLE_RESPONSE_RULES}`
+          },
+          ...recentTurns.map((t) => ({ role: t.role, content: t.content })),
+          { role: 'user', content: cleanQuery }
+        ],
+        temperature: 0.6,
+        maxTokens: 256,
+        sessionId: conversationMgr?.current?.id || 'current',
+        workflow: 'GENERAL_GREETING',
+        onChunk: (delta) => printer.push(delta)
+      });
+      printer.flush();
+      console.log('\n');
+      if (conversationMgr?.addTurn) {
+        await conversationMgr.addTurn('user', cleanQuery);
+        await conversationMgr.addTurn('assistant', stripMarkdownForStorage(fullAnswer));
+      }
+    } catch (err) {
+      printer.flush();
+      console.error(chalk.red(`\nGeneration error: ${err.message}`));
+    }
+    return;
+  }
+
   // 1. Always improvise the query first using the 20B (small) model
   let improvisedQuery = cleanQuery;
   const improviseSpinner = createSpinner('Improvising search query with 20B model...').start();
@@ -67,6 +216,8 @@ async function runRagConsultation({
         { role: 'user', content: improvisePrompt }
       ],
       temperature: 0.1,
+      maxTokens: 512,
+      reasoningEffort: 'low',
       sessionId: conversationMgr?.current?.id || 'current',
       workflow: isBibleScope ? 'IMPROVISE_BIBLE_QUERY' : 'IMPROVISE_GENERAL_QUERY'
     });
@@ -85,6 +236,10 @@ async function runRagConsultation({
     : 'Searching all project sources (Story Bible, chapters, condensed files, notes) with Hybrid RAG...';
   const searchSpinner = createSpinner(searchLabel).start();
 
+  const writtenProgress = !isBibleScope
+    ? await loadWrittenProgressSummary(cwd)
+    : { text: '', hasWrittenContent: false };
+
   let rerankedChunks = [];
   try {
     const queryVector = await embedder.embedQuery(improvisedQuery);
@@ -102,11 +257,12 @@ async function runRagConsultation({
     }
 
     const candidates = await vectorStore.hybridSearch(searchOpts);
-    const defaultTopK = isBibleScope ? 5 : 6;
+    const defaultTopK = isBibleScope ? 5 : 8;
     rerankedChunks = await reranker.rerank({
       queryText: improvisedQuery,
       candidates,
-      topK: config?.rag?.rerankTopK || defaultTopK
+      topK: Math.max(config?.rag?.rerankTopK || defaultTopK, isBibleScope ? 1 : 8),
+      minScore: config?.rag?.minScore ?? 0.03
     });
 
     if (isBibleScope) {
@@ -115,6 +271,27 @@ async function runRagConsultation({
           Number(c.authority_tier) === 1 ||
           String(c.source_path || '').startsWith('story-bible/')
       );
+    } else if (
+      writtenProgress.hasWrittenContent &&
+      rerankedChunks.every((c) => Number(c.authority_tier) !== 2)
+    ) {
+      try {
+        const tier2Candidates = await vectorStore.hybridSearch({
+          ...searchOpts,
+          sourceTypes: ['condensed-story-so-far', 'chapter-summary', 'chapter', 'condensed-prose', 'condensed-plan'],
+          authorityTiers: [2]
+        });
+        if (tier2Candidates?.length > 0) {
+          const tier2Ranked = await reranker.rerank({
+            queryText: improvisedQuery,
+            candidates: tier2Candidates,
+            topK: 4
+          });
+          rerankedChunks = [...rerankedChunks, ...tier2Ranked];
+        }
+      } catch {
+        // Supplemental Tier 2 search is best-effort
+      }
     }
 
     const sourceDesc = isBibleScope ? 'Story Bible sources' : 'project sources';
@@ -123,8 +300,7 @@ async function runRagConsultation({
     searchSpinner.fail(`Retrieval error: ${err.message}`);
   }
 
-  // 3. Assemble Context & System Prompt
-  const instructions = await loadInstructions(cwd);
+  // 3. Assemble Context & System Prompt (omit prose-style <system_instructions> so Q&A stays crisp & factual)
   let systemMessage = '';
 
   if (isBibleScope) {
@@ -132,21 +308,48 @@ async function runRagConsultation({
       ? buildStoryBibleContext(rerankedChunks)
       : '<story_bible_lore>\n(No matching Story Bible entries found)\n</story_bible_lore>';
 
-    systemMessage = `${instructions ? `<system_instructions>\n${instructions.trim()}\n</system_instructions>\n\n` : ''}${bibleContext}${rollingSummary ? `\n\n<recent_discussion_summary>\n${rollingSummary}\n</recent_discussion_summary>` : ''}
+    systemMessage = `${bibleContext}${rollingSummary ? `\n\n<recent_discussion_summary>\n${rollingSummary}\n</recent_discussion_summary>` : ''}
 
 You are Quillbot, a helpful Story Bible canon assistant.
 Answer the author's question based strictly on the Story Bible files retrieved above.
 Mention the relevant Story Bible filenames naturally in plain text. If a detail is not recorded in the Story Bible yet, state that clearly and offer helpful creative suggestions consistent with existing canon.
 ${READABLE_RESPONSE_RULES}`;
   } else {
-    const tier1 = rerankedChunks.filter((c) => Number(c.authority_tier) === 1);
-    const tier2 = rerankedChunks.filter((c) => Number(c.authority_tier) === 2);
-    const tier3 = rerankedChunks.filter((c) => Number(c.authority_tier) === 3);
+    // 1. Deduplicate tier1 chunks by source_path + section_title and allow up to 6 chunks
+    const seenTier1 = new Set();
+    const uniqueTier1 = [];
+    for (const c of rerankedChunks.filter((c) => Number(c.authority_tier) === 1)) {
+      const key = `${c.source_path || ''}::${c.section_title || ''}`;
+      if (!seenTier1.has(key)) {
+        seenTier1.add(key);
+        uniqueTier1.push(c);
+      }
+    }
+    const tier1 = uniqueTier1.slice(0, 6);
+
+    // 2. Filter out Tier 2 chunks that are already injected via loadWrittenProgressSummary
+    // (e.g. .condensed/story-so-far.md and chapter-XX/summary.md)
+    const tier2Candidates = rerankedChunks.filter((c) => Number(c.authority_tier) === 2);
+    const uniqueTier2 = [];
+    const seenTier2 = new Set();
+    for (const c of tier2Candidates) {
+      const p = String(c.source_path || '').replace(/\\/g, '/');
+      const isAlreadyInSummary = writtenProgress.hasWrittenContent && (
+        p.endsWith('summary.md') || p.endsWith('story-so-far.md')
+      );
+      const key = `${c.source_path || ''}::${c.section_title || ''}`;
+      if (!isAlreadyInSummary && !seenTier2.has(key)) {
+        seenTier2.add(key);
+        uniqueTier2.push(c);
+      }
+    }
+    const tier2 = uniqueTier2.slice(0, 4);
+    const tier3 = rerankedChunks.filter((c) => Number(c.authority_tier) === 3).slice(0, 2);
 
     const hierarchyXml = buildHierarchyContext({
-      instructions,
       tier1Chunks: tier1,
       tier2Chunks: tier2,
+      pastChapterSummaries: writtenProgress.text,
       tier3Chunks: tier3,
       rollingSummary
     });
@@ -155,7 +358,11 @@ ${READABLE_RESPONSE_RULES}`;
 
 You are Quillbot, a helpful novel writing assistant consulting across all project sources: Story Bible canon, chapter plans, chapter manuscripts, condensed progress files (.condensed), and archived discussion notes.
 Synthesize the most relevant facts while honoring the Hierarchy of Truth (Story Bible > Chapters & Condensed Progress > Archived Notes), and cite the exact files or chapters you draw from in plain text.
-If something hasn't been written or decided yet, say so clearly and offer practical next-step suggestions.
+
+CRITICAL GROUNDING & MANUSCRIPT INTEGRITY RULES:
+1. Distinguish strictly between events ALREADY WRITTEN in the manuscript (<past_chapters> / project/) versus high-level planned outline arcs in <story_bible_canon> (story-bible/plot-overview.md).
+2. MANUSCRIPT GROUNDING RULE: You may ONLY state that a character, event, or object "appears in the written manuscript" or "has already happened in the story" if that character or event is explicitly named in <past_chapters> (Previous Chapter Summaries or Manuscript Excerpts). If they are only mentioned in <story_bible_canon>, state explicitly that they exist in the planned Story Bible outline but have NOT YET appeared in the written manuscript.
+3. If something hasn't been written or decided yet, say so clearly and offer practical next-step suggestions.
 ${READABLE_RESPONSE_RULES}`;
   }
 
@@ -199,7 +406,7 @@ ${READABLE_RESPONSE_RULES}`;
 
   if (conversationMgr?.addTurn) {
     await conversationMgr.addTurn('user', isBibleScope ? `/bible query ${cleanQuery}` : cleanQuery);
-    await conversationMgr.addTurn('assistant', fullAnswer);
+    await conversationMgr.addTurn('assistant', stripMarkdownForStorage(fullAnswer));
   }
 }
 
@@ -684,10 +891,18 @@ export async function handleBibleSave({
     return;
   }
 
-  const targetFileName = extracted.targetFile || 'world-and-lore.md';
-  const targetPath = path.join(cwd, 'story-bible', targetFileName);
+  const storyBibleRoot = path.resolve(cwd, 'story-bible');
+  const rawName = String(extracted.targetFile || 'world-and-lore.md').replace(/\\/g, '/').replace(/^story-bible\//i, '');
+  let targetPath = path.resolve(storyBibleRoot, rawName);
+  if (
+    targetPath !== storyBibleRoot &&
+    !targetPath.startsWith(`${storyBibleRoot}${path.sep}`)
+  ) {
+    targetPath = path.join(storyBibleRoot, 'world-and-lore.md');
+  }
+  const safeRelativeFile = path.relative(storyBibleRoot, targetPath).replace(/\\/g, '/');
 
-  const preview = `# Proposed Addition to story-bible/${targetFileName}
+  const preview = `# Proposed Addition to story-bible/${safeRelativeFile}
 **Rationale:** ${extracted.rationale || 'New lore decision'}
 **Section:** ${extracted.sectionTitle || 'General'}
 
@@ -698,7 +913,7 @@ ${extracted.markdownContent}
 
   const review = await promptReviewWorkflow({
     draftContent: extracted.markdownContent,
-    itemLabel: `addition to story-bible/${targetFileName}`,
+    itemLabel: `addition to story-bible/${safeRelativeFile}`,
     allowPause: false,
     preferredEditor: config.editor,
     quotaManager: groqClient?.quotaManager,
@@ -707,12 +922,25 @@ ${extracted.markdownContent}
   });
 
   if (review.action === 'accept') {
-    // Safety Backup before appending
-    await createBackup(targetPath, cwd);
+    await fs.mkdir(path.dirname(targetPath), { recursive: true });
+    let existing = '';
+    try {
+      existing = await fs.readFile(targetPath, 'utf8');
+      await createBackup(targetPath, cwd);
+    } catch {
+      existing = '';
+    }
 
-    const toAppend = `\n\n### ${extracted.sectionTitle || 'New Entry'}\n${review.content.trim()}\n`;
+    const sectionTitle = (extracted.sectionTitle || 'New Entry').trim();
+    const cleanedBody = review.content.trim();
+    const trimmedBodyWithoutDupHeader = cleanedBody.replace(
+      new RegExp(`^#{1,6}\\s+${sectionTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\n+`, 'i'),
+      ''
+    );
+    const prefix = existing.trim() ? '\n\n' : '';
+    const toAppend = `${prefix}### ${sectionTitle}\n${trimmedBodyWithoutDupHeader}\n`;
     await fs.appendFile(targetPath, toAppend, 'utf8');
-    console.log(chalk.green(`\nAppended new lore to story-bible/${targetFileName} without affecting previous content.`));
+    console.log(chalk.green(`\nAppended new lore to story-bible/${safeRelativeFile} without affecting previous content.`));
 
     const syncSpinner = createSpinner('Re-indexing Story Bible...').start();
     try {

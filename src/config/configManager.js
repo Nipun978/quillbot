@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import dotenv from 'dotenv';
-import { input, password } from '@inquirer/prompts';
+import { input, password, select } from '@inquirer/prompts';
 import chalk from 'chalk';
 import { hasState, saveState, getDefaultState } from './stateManager.js';
 import { probeApiKey } from '../llm/quotaManager.js';
@@ -12,33 +12,100 @@ const CONFIG_DIR = '.quillbot';
 const CONFIG_FILE = 'config.json';
 const INSTRUCTIONS_FILE = 'instructions.md';
 
-export const DEFAULT_INSTRUCTIONS = `# Quillbot Literary Prose & Pacing Instructions
+export const REASONING_LEVELS = ['low', 'medium', 'high'];
+export const INVARIANT_TEMPERATURES = {
+  temperaturePlan: 0.1,
+  temperatureWrite: 0.3,
+  temperatureSummaries: 0.1
+};
 
-## 1. Prime Narrative Objective
-Deliver immersive, psychologically nuanced, and scene-grounded prose. Write strictly one beat at a time, honoring the emotional and dramatic arc outlined in the chapter plan without rushing toward future events.
+// Permanent Zero-Invention Engine: Creativity is locked to 'off' for all users
+export const CREATIVITY_LEVELS = ['off'];
+export function getCreativityTemperatures() {
+  return { ...INVARIANT_TEMPERATURES };
+}
 
-## 2. Point of View & Tense
-- **Default POV:** Close Third-Person Limited (or First-Person if specified in the Story Bible). Stay anchored inside the POV character's immediate perception, sensory field, and inner filter.
-- **Tense:** Past Tense (consistent throughout).
+export function getExecutionProfile(workflow = '', config = {}) {
+  const isPaid = config.apiTier === 'paid' || config.apiTier === 'developer';
+  let defaultEffort = String(config.generation?.defaultReasoningEffort || config.defaultReasoningEffort || 'medium').toLowerCase();
+  if (!REASONING_LEVELS.includes(defaultEffort)) {
+    defaultEffort = 'medium';
+  }
+  if (!isPaid && defaultEffort === 'high') {
+    defaultEffort = 'medium';
+  }
 
-## 3. Sensory Grounding & Atmosphere
-- Ground every scene in tangible sensory specifics: sound, texture, temperature, ambient lighting, and smell.
-- Ground emotional tension in physical actions, micro-expressions, posture shifts, and involuntary physical responses.
-- Avoid abstract melodrama, clinical emotional labels ("he felt sad", "she was terrified"), and melodramatic clichés.
+  // 1. Open Questions Workflows (120B model at high reasoning — allowed on both Free & Paid tier)
+  if (workflow === 'INIT_QUESTIONS' || workflow === 'PLAN_BEAT_QUESTIONS') {
+    return {
+      reasoningEffort: 'high',
+      maxTokens: 3072,
+      ...INVARIANT_TEMPERATURES
+    };
+  }
 
-## 4. Beat Integrity & Micro-Pacing
-- **Do not rush ahead:** Fulfill only the assigned beat's action and emotional turn. Do not resolve future conflicts or bleed into subsequent beats prematurely.
-- **Scene transition:** Build seamlessly on the preceding beat's final moments. Pick up physical props, spatial orientation, and ongoing dialogue without repetition or abrupt cuts.
-- **Dialogue:** Keep character voices distinct, textured by cadence, regional dialect (if established in the Story Bible), and subtext. Dialogue must serve character motivation or conflict, never pure exposition.
+  // 2. Scene Planning & Writing Workflows (Baseline reasoning minimum: medium to eliminate dialogue confusion)
+  if (
+    workflow === 'PLAN_BEAT' ||
+    workflow === 'PLAN_CHAPTER_HEADER' ||
+    workflow === 'PLAN_CHAPTER_BEAT' ||
+    workflow === 'PLAN_CHAPTER' ||
+    workflow === 'WRITE_BEAT' ||
+    workflow === 'EDIT_BEAT' ||
+    workflow === 'EDIT_CHAPTER'
+  ) {
+    const effort = (isPaid && defaultEffort === 'high') ? 'high' : 'medium';
+    return {
+      reasoningEffort: effort,
+      maxTokens: 4096,
+      ...INVARIANT_TEMPERATURES
+    };
+  }
 
-## 5. Tone & AI Anti-Patterns
-- Never summarize the moral of the scene or editorialize in the narrative voice.
-- Avoid purple prose, redundant metaphors, repetitive adjectives, and robotic dialogue markers ("he retorted with determination").
-- Strictly uphold facts, relationship dynamics, and world lore recorded in the Story Bible.
+  // 3. Utility / General REPL Workflows
+  return {
+    reasoningEffort: defaultEffort,
+    maxTokens: 2048,
+    ...INVARIANT_TEMPERATURES
+  };
+}
+
+export function getCreativityExecutionProfile(creativity = 'off', isPaid = false) {
+  return {
+    creativity: 'off',
+    reasoningEffort: isPaid ? 'high' : 'medium',
+    maxTokens: 4096,
+    ...INVARIANT_TEMPERATURES
+  };
+}
+
+export const DEFAULT_INSTRUCTIONS = `# Quillbot Literary Prose Directives
+- **POV & Tense:** Close Third-Person Limited, Past Tense (consistent throughout).
+- **Precedence Hierarchy:** Beat Instructions > Chapter Instructions > Global Style. Past Chapter Progress > Story Bible Lore.
+- **Execution & Scope:** Write strictly one beat at a time from preceding tail.
+- **Grounded Physicality:** Anchor subtext in physical action and sensory micro-details.
+- **Zero Hallucination:** Never manufacture unmentioned characters, events, or backstory. Obey continuity.
 `;
 
 export function buildInstructionsContent({ projectTitle = 'Untitled Novel', writingStyle = '', enhancedWritingStyle = '' } = {}) {
   let content = `# ${projectTitle} — Literary Prose & Pacing Instructions\n\n`;
+  const combinedStyle = `${enhancedWritingStyle || ''}\n${writingStyle || ''}`.toLowerCase();
+
+  let defaultInstructions = DEFAULT_INSTRUCTIONS;
+
+  // Reconcile Point of View & Tense to prevent contradictory rules in <system_instructions>
+  const specifiesFirstPerson = /\b(first-person|first person|1st-person|1st person)\b/i.test(combinedStyle);
+  const specifiesPresentTense = /\b(present tense|present-tense)\b/i.test(combinedStyle);
+
+  if (specifiesFirstPerson || specifiesPresentTense) {
+    const povDirective = specifiesFirstPerson ? 'First-Person (matching Author Writing Style Preferences)' : 'Close Third-Person Limited';
+    const tenseDirective = specifiesPresentTense ? 'Present Tense (consistent throughout)' : 'Past Tense (consistent throughout)';
+    defaultInstructions = defaultInstructions.replace(
+      /- \*\*POV & Tense:\*\*.*?$/m,
+      `- **POV & Tense:** ${povDirective}, ${tenseDirective}.`
+    );
+  }
+
   if (enhancedWritingStyle) {
     content += `## Author Writing Style Preferences & Enhanced Prose Guide\n`;
     if (writingStyle && writingStyle.trim() !== enhancedWritingStyle.trim()) {
@@ -48,7 +115,7 @@ export function buildInstructionsContent({ projectTitle = 'Untitled Novel', writ
   } else if (writingStyle) {
     content += `## Author Writing Style Preferences & Tone\n${writingStyle}\n\n`;
   }
-  content += DEFAULT_INSTRUCTIONS;
+  content += defaultInstructions;
   return content;
 }
 
@@ -101,8 +168,12 @@ export function getDefaultConfig() {
       rrfK: 60
     },
     generation: {
-      temperaturePlan: 0.6,
-      temperatureWrite: 0.75,
+      defaultReasoningEffort: 'medium',
+      temperaturePlan: INVARIANT_TEMPERATURES.temperaturePlan,
+      temperatureWrite: INVARIANT_TEMPERATURES.temperatureWrite,
+      temperatureSummaries: INVARIANT_TEMPERATURES.temperatureSummaries,
+      maxTokensPlan: 4096,
+      maxTokensWrite: 4096,
       continuityTailWords: 350,
       slidingChatWindowTurns: 8,
       enableContinuityCritic: true
@@ -117,19 +188,38 @@ export async function loadConfig(cwd = process.cwd()) {
   try {
     const raw = await fs.readFile(filePath, 'utf8');
     const parsed = JSON.parse(raw);
+    const apiTier = parsed.apiTier || defaults.apiTier;
+    const isPaid = apiTier === 'paid' || apiTier === 'developer';
+    let resolvedReasoning = parsed.generation?.defaultReasoningEffort || parsed.generation?.reasoningEffort || parsed.defaultReasoningEffort || defaults.generation.defaultReasoningEffort;
+    if (!REASONING_LEVELS.includes(resolvedReasoning)) {
+      resolvedReasoning = 'medium';
+    }
+    if (!isPaid && resolvedReasoning === 'high') {
+      console.warn(`[Config] Reasoning effort 'high' is restricted to paid plan users. Auto-clamping to 'medium'.`);
+      resolvedReasoning = 'medium';
+    }
+
     const config = {
       ...defaults,
       ...parsed,
       projectTitle: parsed.projectTitle || defaults.projectTitle,
       writingStyle: parsed.writingStyle || defaults.writingStyle,
       enhancedWritingStyle: parsed.enhancedWritingStyle || '',
-      apiTier: parsed.apiTier || defaults.apiTier,
+      apiTier,
       cooldownSeconds: parsed.cooldownSeconds !== undefined ? parsed.cooldownSeconds : defaults.cooldownSeconds,
       rateLimits: parsed.rateLimits || defaults.rateLimits,
       models: { ...defaults.models, ...(parsed.models || {}) },
       ollama: { ...defaults.ollama, ...(parsed.ollama || {}) },
       rag: { ...defaults.rag, ...(parsed.rag || {}) },
-      generation: { ...defaults.generation, ...(parsed.generation || {}) }
+      generation: {
+        ...defaults.generation,
+        ...(parsed.generation || {}),
+        temperaturePlan: INVARIANT_TEMPERATURES.temperaturePlan,
+        temperatureWrite: INVARIANT_TEMPERATURES.temperatureWrite,
+        temperatureSummaries: INVARIANT_TEMPERATURES.temperatureSummaries,
+        defaultReasoningEffort: resolvedReasoning,
+        creativity: 'off'
+      }
     };
     if (!config.groqApiKey && process.env.GROQ_API_KEY) {
       config.groqApiKey = process.env.GROQ_API_KEY;
@@ -239,7 +329,8 @@ export async function enhanceWritingStyleWithAi({
   projectTitle = 'Untitled Novel',
   writingStyle = '',
   groqApiKey = '',
-  model = 'openai/gpt-oss-20b'
+  model = 'openai/gpt-oss-20b',
+  baseUrl = undefined
 } = {}) {
   const trimmed = (writingStyle || '').trim();
   if (!trimmed || !groqApiKey) {
@@ -248,20 +339,27 @@ export async function enhanceWritingStyleWithAi({
 
   try {
     const { Groq } = await import('groq-sdk');
-    const client = new Groq({ apiKey: groqApiKey });
+    const client = new Groq({
+      apiKey: groqApiKey,
+      ...(baseUrl ? { baseURL: baseUrl } : {})
+    });
 
     const systemPrompt = `You are an elite literary prose editor and novelist consultant.
 The author is writing a novel titled "${projectTitle}".
-The author has provided writing style preferences. Your task is to stylize and sharpen these preferences into punchy, high-impact global writing instructions strictly UNDER 100 WORDS.
+The author has provided writing style preferences. Your task is to sharpen and clarify these preferences into disciplined, high-impact global writing instructions strictly UNDER 100 WORDS.
 
-Rules:
-1. Cover POV, tense, prose cadence, atmospheric tone, and sensory grounding.
-2. Keep the entire response strictly UNDER 100 WORDS.
-3. Be clear, direct, and actionable for an AI story-writing agent.
-4. Output ONLY the stylized global instructions text. Do not include titles, markdown headings, bullet headers, pleasantries, or preamble.`;
+CRITICAL RULES:
+1. STRICT FIDELITY TO AUTHOR'S VOICE: Enhance how the author pictures the prose without inventing an opposite or artificial style. Preserve the author's requested emotional distance, diction, and cultural rhythm.
+2. BAN PURPLE PROSE & CLICHÉS: Strictly forbid flowery clichés, decorative sensory checklists (e.g. do not invent lists of ambient smells or weather tropes), and psychological over-explanation. Prioritize grounded realism and restraint.
+3. PRESERVE POV & TENSE: Adhere strictly to the novel's default Past Tense and Third-Person POV unless the author explicitly requested otherwise. Never switch to Present Tense.
+4. STRICT LENGTH LIMIT: Keep the entire response strictly UNDER 100 WORDS.
+5. FORMAT: Output ONLY the concise instructions text. Do not include titles, markdown headings, bullet headers, pleasantries, or preamble.`;
+
+    const resolvedModel = model || 'openai/gpt-oss-20b';
+    const isReasoning = /gpt-oss|deepseek-r1|qwq|reasoning/i.test(resolvedModel);
 
     const response = await client.chat.completions.create({
-      model: model || 'openai/gpt-oss-20b',
+      model: resolvedModel,
       messages: [
         { role: 'system', content: systemPrompt },
         {
@@ -270,10 +368,15 @@ Rules:
         }
       ],
       temperature: 0.4,
-      max_tokens: 250
+      max_tokens: 1024,
+      ...(isReasoning ? { reasoning_effort: 'low' } : {})
     });
 
-    let enhanced = response.choices[0]?.message?.content?.trim() || trimmed;
+    let raw = response.choices[0]?.message?.content?.trim() || '';
+    if (raw.includes('</think>')) {
+      raw = raw.slice(raw.indexOf('</think>') + 8).trim();
+    }
+    let enhanced = raw || trimmed;
     // Enforce under 100 words guardrail cleanly at sentence boundary
     enhanced = truncateAtSentenceBoundary(enhanced, 100);
     return enhanced || trimmed;
@@ -393,11 +496,51 @@ export async function runOnboardingWizard(cwd = process.cwd()) {
     enhancedWritingStyle = finalStyle;
   }
 
+  // 4. Select Default Reasoning Effort (Paid Tier Gated)
+  const isPaidTier = probeInfo?.tier === 'developer';
+  let defaultReasoningEffort = 'medium';
+
+  const choices = [
+    {
+      name: `${chalk.bold('medium')} — Balanced Reasoning (Recommended: deep analytical reasoning & sharp dialogue clarity)`,
+      value: 'medium'
+    },
+    {
+      name: `${chalk.bold('low')}    — Fast Reasoning (Lightweight analysis, lowest latency)`,
+      value: 'low'
+    }
+  ];
+
+  if (isPaidTier) {
+    choices.push({
+      name: `${chalk.bold('high')}   — Deep Reasoning (Maximal thinking tokens, comprehensive multi-step analysis)`,
+      value: 'high'
+    });
+  } else {
+    choices.push({
+      name: `${chalk.dim('high [Paid Only]')} — Deep Reasoning (Requires Developer / Paid Plan)`,
+      value: 'high',
+      disabled: '(Requires Developer / Paid Plan)'
+    });
+  }
+
+  if (process.stdin.isTTY) {
+    try {
+      defaultReasoningEffort = await select({
+        message: 'Default Reasoning Effort:',
+        choices,
+        default: 'medium'
+      });
+    } catch {
+      defaultReasoningEffort = 'medium';
+    }
+  }
+
   const newConfig = {
     ...defaults,
-    apiTier: probeInfo?.tier === 'developer' ? 'paid' : 'free',
+    apiTier: isPaidTier ? 'paid' : 'free',
     rateLimits: probeInfo?.limits || defaults.rateLimits,
-    cooldownSeconds: 45,
+    cooldownSeconds: isPaidTier ? 0 : 45,
     projectTitle: projectTitle.trim() || 'Untitled Novel',
     writingStyle: finalStyle,
     enhancedWritingStyle,
@@ -411,7 +554,15 @@ export async function runOnboardingWizard(cwd = process.cwd()) {
       baseUrl: ollamaUrl.trim(),
       embeddingModel: embeddingModel.trim()
     },
-    editor: editorChoice.trim()
+    editor: editorChoice.trim(),
+    generation: {
+      ...defaults.generation,
+      defaultReasoningEffort,
+      temperaturePlan: INVARIANT_TEMPERATURES.temperaturePlan,
+      temperatureWrite: INVARIANT_TEMPERATURES.temperatureWrite,
+      temperatureSummaries: INVARIANT_TEMPERATURES.temperatureSummaries,
+      creativity: 'off'
+    }
   };
 
   await ensureProjectDirectories(cwd, newConfig);

@@ -6,16 +6,18 @@ import {
   INIT_OVERVIEW_SYSTEM_PROMPT,
   INIT_CHARACTERS_SYSTEM_PROMPT,
   INIT_LOCATIONS_SYSTEM_PROMPT,
-  INIT_WORLD_LORE_SYSTEM_PROMPT
+  INIT_WORLD_LORE_SYSTEM_PROMPT,
+  GENERATE_INIT_QUESTIONS_SYSTEM_PROMPT,
+  buildCreativityDirective
 } from '../llm/prompts.js';
 import { createSpinner, printMarkdown } from '../ui/renderer.js';
-import { promptReviewWorkflow } from '../ui/reviewPrompt.js';
+import { promptReviewWorkflow, openInEditor } from '../ui/reviewPrompt.js';
 import { syncAllFiles } from '../rag/fileSync.js';
-import { saveConfig, updateInstructionsFile, enhanceWritingStyleWithAi } from '../config/configManager.js';
+import { saveConfig, updateInstructionsFile, enhanceWritingStyleWithAi, getCreativityTemperatures, getExecutionProfile } from '../config/configManager.js';
 import { ensureCondensedDirectories } from '../config/condensedManager.js';
 import { ensureStdinRaw } from '../ui/ttyManager.js';
 
-async function generateCondensedSummary(text, label, groqClient) {
+async function generateCondensedSummary(text, label, groqClient, temperature = 0.2) {
   if (!text || !groqClient) {
     return text ? text.slice(0, 250).replace(/\n+/g, ' ') : '';
   }
@@ -29,12 +31,17 @@ async function generateCondensedSummary(text, label, groqClient) {
         },
         { role: 'user', content: text.slice(0, 4000) }
       ],
-      temperature: 0.2,
-      maxTokens: 150,
+      temperature,
+      maxTokens: 1024,
+      reasoningEffort: 'low',
       sessionId: 'init_condense',
       workflow: 'INIT_CONDENSE'
     });
-    return res.trim();
+    const trimmed = (res || '').trim();
+    if (!trimmed) {
+      throw new Error('Empty condensed summary response');
+    }
+    return trimmed;
   } catch {
     return text.slice(0, 250).replace(/\n+/g, ' ');
   }
@@ -76,7 +83,8 @@ export async function runInitProjectWorkflow({
           projectTitle: config.projectTitle,
           writingStyle: config.writingStyle,
           groqApiKey: config.groqApiKey,
-          model: config.models?.small || 'openai/gpt-oss-20b'
+          model: config.models?.small || 'openai/gpt-oss-20b',
+          baseUrl: config.groqBaseUrl || config.baseUrl
         });
         styleSpinner.succeed('Global stylized writing instructions created.');
       } catch {
@@ -91,6 +99,35 @@ export async function runInitProjectWorkflow({
       writingStyle: config.writingStyle,
       enhancedWritingStyle: config.enhancedWritingStyle
     });
+  } else if (
+    config.groqApiKey &&
+    config.writingStyle &&
+    (!config.enhancedWritingStyle || config.enhancedWritingStyle.trim() === config.writingStyle.trim())
+  ) {
+    const styleSpinner = createSpinner('Stylizing global writing instructions with 20B model (< 100 words)...').start();
+    try {
+      const enhanced = await enhanceWritingStyleWithAi({
+        projectTitle: config.projectTitle,
+        writingStyle: config.writingStyle,
+        groqApiKey: config.groqApiKey,
+        model: config.models?.small || 'openai/gpt-oss-20b',
+        baseUrl: config.groqBaseUrl || config.baseUrl
+      });
+      if (enhanced && enhanced.trim() && enhanced.trim() !== config.writingStyle.trim()) {
+        config.enhancedWritingStyle = enhanced;
+        await saveConfig(config, cwd);
+        await updateInstructionsFile(cwd, {
+          projectTitle: config.projectTitle,
+          writingStyle: config.writingStyle,
+          enhancedWritingStyle: config.enhancedWritingStyle
+        });
+        styleSpinner.succeed('Global stylized writing instructions created.');
+      } else {
+        styleSpinner.stop();
+      }
+    } catch {
+      styleSpinner.stop();
+    }
   }
 
   let synopsis = initialSynopsis;
@@ -106,6 +143,54 @@ export async function runInitProjectWorkflow({
     return;
   }
 
+  // Step 0: Generate open clarifying questions using 120B model at high reasoning before Bible generation
+  let authorClarifications = '';
+  if (config.groqApiKey) {
+    console.log(chalk.bold.cyan('\n  Analyzing synopsis and formulating clarifying questions (120B model)...'));
+    const questionsProfile = getExecutionProfile('INIT_QUESTIONS', config);
+    const qSpinner = createSpinner('Generating targeted open questions on premise & stakes...').start();
+    let questionsDraft = '';
+    try {
+      const qPrompt = `Project Title: ${config.projectTitle || 'Untitled Novel'}
+Thematic Tone & Setting Palette:
+${config.writingStyle || 'Atmospheric, grounded, psychologically nuanced'}
+
+Story Synopsis:
+${synopsis.trim()}`;
+
+      questionsDraft = await groqClient.chatCompletion({
+        model: 'large',
+        messages: [
+          { role: 'system', content: GENERATE_INIT_QUESTIONS_SYSTEM_PROMPT },
+          { role: 'user', content: qPrompt }
+        ],
+        temperature: questionsProfile.temperaturePlan,
+        maxTokens: questionsProfile.maxTokens,
+        reasoningEffort: questionsProfile.reasoningEffort,
+        sessionId: 'init_questions',
+        workflow: 'INIT_QUESTIONS'
+      });
+      qSpinner.succeed('Clarifying questions generated.');
+    } catch (err) {
+      qSpinner.warn(`Skipping open questions generation: ${err.message}`);
+    }
+
+    if (questionsDraft && questionsDraft.trim()) {
+      console.log(chalk.cyan('Opening questions in your editor for clarifications. Answer what you wish, then save and close.'));
+      try {
+        const answeredQuestions = await openInEditor(questionsDraft, config.editor);
+        if (answeredQuestions && answeredQuestions.trim() && answeredQuestions.trim() !== questionsDraft.trim()) {
+          authorClarifications = answeredQuestions.trim();
+          console.log(chalk.green('✓ Author clarifications saved. Incorporating into Story Bible generation.'));
+        } else {
+          console.log(chalk.dim('No additional clarifications entered. Continuing with original synopsis.'));
+        }
+      } catch (err) {
+        console.log(chalk.yellow(`Could not open editor (${err.message}). Continuing with original synopsis.`));
+      }
+    }
+  }
+
   const bibleDir = path.join(cwd, 'story-bible');
   await fs.mkdir(bibleDir, { recursive: true });
   await ensureCondensedDirectories(cwd);
@@ -113,6 +198,12 @@ export async function runInitProjectWorkflow({
   const activeStyle = config.enhancedWritingStyle
     ? config.enhancedWritingStyle.trim()
     : (config.writingStyle || '');
+
+  const creativity = config?.generation?.creativity || config?.creativity || 'off';
+  const creativityDirective = buildCreativityDirective(creativity);
+  const execProfile = getExecutionProfile('INIT_OVERVIEW', config);
+  const planTemp = execProfile.temperaturePlan;
+  const summaryTemp = execProfile.temperatureSummaries;
 
   // -------------------------------------------------------------
   // STEP 1: plot-overview.md
@@ -126,11 +217,15 @@ export async function runInitProjectWorkflow({
     const spinner = createSpinner('Drafting plot overview in paragraph format...').start();
     try {
       const userPrompt = `Project Title: ${config.projectTitle}
-Writing Style Specification:
-${activeStyle}
+Thematic Tone & Setting Palette:
+${config.writingStyle || 'Atmospheric, grounded, psychologically nuanced'}
+(Format Directive: Maintain strictly objective, third-person archival prose. Do NOT write in first-person 'I'.)
 
 Story Synopsis:
 ${synopsis.trim()}
+${authorClarifications ? `\n<author_clarifications>\n${authorClarifications}\n</author_clarifications>` : ''}
+
+${creativityDirective}
 ${overviewFeedback ? `\nRevision Feedback from author:\n${overviewFeedback}` : ''}`;
 
       if (groqClient?.quotaManager) {
@@ -147,7 +242,7 @@ ${overviewFeedback ? `\nRevision Feedback from author:\n${overviewFeedback}` : '
           { role: 'system', content: INIT_OVERVIEW_SYSTEM_PROMPT },
           { role: 'user', content: userPrompt }
         ],
-        temperature: 0.6,
+        temperature: planTemp,
         sessionId: 'init_overview',
         workflow: 'INIT_OVERVIEW'
       });
@@ -180,12 +275,12 @@ ${overviewFeedback ? `\nRevision Feedback from author:\n${overviewFeedback}` : '
       await fs.writeFile(path.join(bibleDir, 'plot-overview.md'), overviewContent, 'utf8');
       console.log(chalk.green('✓ Saved story-bible/plot-overview.md'));
     } else if (review.action === 'retry') {
-      overviewFeedback = review.feedback || 'Please deepen the central conflict and act turns.';
+      overviewFeedback = review.feedback || 'Please deepen the central conflict and timeline milestones.';
     }
   }
 
   // Create condensed overview to pass to next steps (Requirement 8: Do not send entire files!)
-  const condensedOverview = await generateCondensedSummary(overviewContent, 'Plot Overview', groqClient);
+  const condensedOverview = await generateCondensedSummary(overviewContent, 'Plot Overview', groqClient, summaryTemp);
 
   // -------------------------------------------------------------
   // STEP 2: characters.md
@@ -200,15 +295,19 @@ ${overviewFeedback ? `\nRevision Feedback from author:\n${overviewFeedback}` : '
     try {
       // Notice: Only sending synopsis + condensed overview, NOT entire plot-overview.md
       const userPrompt = `Project Title: ${config.projectTitle}
-Writing Style Specification:
-${activeStyle}
+Thematic Tone & Setting Palette:
+${config.writingStyle || 'Atmospheric, grounded, psychologically nuanced'}
+(Format Directive: Maintain strictly objective, third-person archival prose. Do NOT write in first-person 'I'.)
 
 Story Synopsis:
 ${synopsis.trim()}
+${authorClarifications ? `\n<author_clarifications>\n${authorClarifications}\n</author_clarifications>` : ''}
 
 <condensed_plot_overview>
 ${condensedOverview}
 </condensed_plot_overview>
+
+${creativityDirective}
 ${charactersFeedback ? `\nRevision Feedback from author:\n${charactersFeedback}` : ''}`;
 
       if (groqClient?.quotaManager) {
@@ -225,7 +324,7 @@ ${charactersFeedback ? `\nRevision Feedback from author:\n${charactersFeedback}`
           { role: 'system', content: INIT_CHARACTERS_SYSTEM_PROMPT },
           { role: 'user', content: userPrompt }
         ],
-        temperature: 0.6,
+        temperature: planTemp,
         sessionId: 'init_characters',
         workflow: 'INIT_CHARACTERS'
       });
@@ -263,7 +362,7 @@ ${charactersFeedback ? `\nRevision Feedback from author:\n${charactersFeedback}`
   }
 
   // Create condensed character cast
-  const condensedCharacters = await generateCondensedSummary(charactersContent, 'Character Cast', groqClient);
+  const condensedCharacters = await generateCondensedSummary(charactersContent, 'Character Cast', groqClient, summaryTemp);
 
   // -------------------------------------------------------------
   // STEP 3: locations.md
@@ -278,11 +377,13 @@ ${charactersFeedback ? `\nRevision Feedback from author:\n${charactersFeedback}`
     try {
       // Notice: Only sending synopsis + condensed overview + condensed characters
       const userPrompt = `Project Title: ${config.projectTitle}
-Writing Style Specification:
-${activeStyle}
+Thematic Tone & Setting Palette:
+${config.writingStyle || 'Atmospheric, grounded, psychologically nuanced'}
+(Format Directive: Maintain strictly objective, third-person archival prose. Do NOT write in first-person 'I'.)
 
 Story Synopsis:
 ${synopsis.trim()}
+${authorClarifications ? `\n<author_clarifications>\n${authorClarifications}\n</author_clarifications>` : ''}
 
 <condensed_narrative_context>
 ${condensedOverview}
@@ -291,6 +392,8 @@ ${condensedOverview}
 <key_character_roster>
 ${condensedCharacters}
 </key_character_roster>
+
+${creativityDirective}
 ${locationsFeedback ? `\nRevision Feedback from author:\n${locationsFeedback}` : ''}`;
 
       if (groqClient?.quotaManager) {
@@ -307,7 +410,7 @@ ${locationsFeedback ? `\nRevision Feedback from author:\n${locationsFeedback}` :
           { role: 'system', content: INIT_LOCATIONS_SYSTEM_PROMPT },
           { role: 'user', content: userPrompt }
         ],
-        temperature: 0.6,
+        temperature: planTemp,
         sessionId: 'init_locations',
         workflow: 'INIT_LOCATIONS'
       });
@@ -345,7 +448,7 @@ ${locationsFeedback ? `\nRevision Feedback from author:\n${locationsFeedback}` :
   }
 
   // Create condensed locations summary
-  const condensedLocations = await generateCondensedSummary(locationsContent, 'Locations', groqClient);
+  const condensedLocations = await generateCondensedSummary(locationsContent, 'Locations', groqClient, summaryTemp);
 
   // -------------------------------------------------------------
   // STEP 4: world-and-lore.md
@@ -360,11 +463,13 @@ ${locationsFeedback ? `\nRevision Feedback from author:\n${locationsFeedback}` :
     try {
       // Notice: Only sending synopsis + condensed overview + condensed locations
       const userPrompt = `Project Title: ${config.projectTitle}
-Writing Style Specification:
-${activeStyle}
+Thematic Tone & Setting Palette:
+${config.writingStyle || 'Atmospheric, grounded, psychologically nuanced'}
+(Format Directive: Maintain strictly objective, third-person archival prose. Do NOT write in first-person 'I'.)
 
 Story Synopsis:
 ${synopsis.trim()}
+${authorClarifications ? `\n<author_clarifications>\n${authorClarifications}\n</author_clarifications>` : ''}
 
 <condensed_narrative_context>
 ${condensedOverview}
@@ -373,6 +478,8 @@ ${condensedOverview}
 <key_locations_summary>
 ${condensedLocations}
 </key_locations_summary>
+
+${creativityDirective}
 ${worldFeedback ? `\nRevision Feedback from author:\n${worldFeedback}` : ''}`;
 
       if (groqClient?.quotaManager) {
@@ -389,7 +496,7 @@ ${worldFeedback ? `\nRevision Feedback from author:\n${worldFeedback}` : ''}`;
           { role: 'system', content: INIT_WORLD_LORE_SYSTEM_PROMPT },
           { role: 'user', content: userPrompt }
         ],
-        temperature: 0.6,
+        temperature: planTemp,
         sessionId: 'init_world_lore',
         workflow: 'INIT_WORLD_LORE'
       });

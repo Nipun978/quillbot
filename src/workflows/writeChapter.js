@@ -6,9 +6,10 @@ import {
   CHAPTER_SUMMARY_SYSTEM_PROMPT,
   CONTINUITY_CRITIC_SYSTEM_PROMPT,
   buildHierarchyContext,
-  buildStoryBibleContext
+  buildStoryBibleContext,
+  buildCreativityDirective
 } from '../llm/prompts.js';
-import { loadInstructions } from '../config/configManager.js';
+import { loadInstructions, getCreativityTemperatures, getCreativityExecutionProfile, getExecutionProfile } from '../config/configManager.js';
 import { createBackup } from '../config/backupManager.js';
 import { setActiveBeat, loadState } from '../config/stateManager.js';
 import { padChapter } from './planChapter.js';
@@ -40,11 +41,15 @@ export function parseChapterPlanHeader(planContent = '') {
 }
 
 export function parseBeatsFromPlan(planContent) {
+  if (!planContent) return [];
+  const clarifyIdx = planContent.search(/\n##\s+(?:Author\s+Clarifications|Clarifications)/i);
+  const beatsSection = clarifyIdx !== -1 ? planContent.slice(0, clarifyIdx) : planContent;
+
   const beatRegex = /^### Beat (\d+): (.*?)$/gm;
   const indices = [];
   let match;
 
-  while ((match = beatRegex.exec(planContent)) !== null) {
+  while ((match = beatRegex.exec(beatsSection)) !== null) {
     indices.push({
       index: match.index,
       beatNum: parseInt(match[1], 10),
@@ -52,31 +57,62 @@ export function parseBeatsFromPlan(planContent) {
     });
   }
 
+  if (indices.length === 0) return [];
+
+  const lastBeatStartIndex = indices[indices.length - 1].index;
+  const afterLastBeat = beatsSection.slice(lastBeatStartIndex);
+  let lastBeatEndIndex = beatsSection.length;
+  const postSectionMatch = afterLastBeat.match(/\n(##\s+[^\n]+[\s\S]*)$/);
+  if (postSectionMatch) {
+    lastBeatEndIndex = lastBeatStartIndex + postSectionMatch.index;
+  }
+
   const beats = [];
   for (let i = 0; i < indices.length; i++) {
     const start = indices[i].index;
-    const end = i < indices.length - 1 ? indices[i + 1].index : planContent.length;
-    const fullBlock = planContent.slice(start, end).trim();
+    const end = i < indices.length - 1 ? indices[i + 1].index : lastBeatEndIndex;
+    const fullBlock = beatsSection.slice(start, end).trim();
 
     const charsMatch = fullBlock.match(/(?:-\s*)?\*\*Characters:\*\*\s*([^\n\r]+)/i);
-    const locMatch = fullBlock.match(/(?:-\s*)?\*\*Location:\*\*\s*([^\n\r]+)/i);
-    const actMatch = fullBlock.match(/(?:-\s*)?\*\*Action:\*\*\s*([\s\S]*?)(?=(?:(?:-\s*)?\*\*Goal\/Hook:\*\*)|(?:(?:-\s*)?\*\*Instructions:\*\*)|$)/i);
-    const goalMatch = fullBlock.match(/(?:-\s*)?\*\*Goal\/Hook:\*\*\s*([\s\S]*?)(?=(?:(?:-\s*)?\*\*Instructions:\*\*)|$)/i);
-    const instrMatch = fullBlock.match(/(?:-\s*)?\*\*Instructions:\*\*\s*([\s\S]*?)$/i);
+    const settingMatch = fullBlock.match(/(?:-\s*)?\*\*(?:Setting|Location):\*\*\s*([^\n\r]+)/i);
+    const outlineMatch = fullBlock.match(/(?:-\s*)?\*\*(?:Beat Outline|Action):\*\*\s*([\s\S]*?)(?=(?:(?:-\s*)?\*\*(?:Author's Notes|Author Notes|Goal\/Hook|Beat Instructions|Instructions):\*\*)|$)/i);
+    const notesMatch = fullBlock.match(/(?:-\s*)?\*\*(?:Author's Notes|Author Notes|Goal\/Hook):\*\*\s*([\s\S]*?)(?=(?:(?:-\s*)?\*\*(?:Beat Instructions|Instructions):\*\*)|$)/i);
+    const instrMatch = fullBlock.match(/(?:-\s*)?\*\*(?:Beat Instructions|Instructions):\*\*\s*([\s\S]*?)$/i);
+
+    const setting = settingMatch ? settingMatch[1].trim() : '';
+    const outline = outlineMatch ? outlineMatch[1].trim() : '';
+    const authorNotes = notesMatch ? notesMatch[1].trim() : '';
+    const instructions = instrMatch ? instrMatch[1].trim() : '';
 
     beats.push({
       num: indices[i].beatNum,
       title: indices[i].title,
       characters: charsMatch ? charsMatch[1].trim() : '',
-      location: locMatch ? locMatch[1].trim() : '',
-      action: actMatch ? actMatch[1].trim() : '',
-      goalHook: goalMatch ? goalMatch[1].trim() : '',
-      instructions: instrMatch ? instrMatch[1].trim() : '',
+      location: setting,
+      setting,
+      action: outline,
+      beatOutline: outline,
+      goalHook: authorNotes,
+      authorNotes,
+      instructions,
       rawBlock: fullBlock
     });
   }
 
   return beats;
+}
+
+export function parseBeatClarifications(planContent = '', beatNum) {
+  if (!planContent) return '';
+  const clarifySectionMatch = planContent.match(/##\s+(?:Author\s+Clarifications[^\n]*|Clarifications[^\n]*)([\s\S]*)/i);
+  if (!clarifySectionMatch) return '';
+  const sectionBody = clarifySectionMatch[1];
+
+  // Match either ### Beat N: or ## Beat N: or Beat N
+  const beatRegex = new RegExp(`###?\\s*Beat\\s*${beatNum}[:\\s][^\\n]*([\\s\\S]*?)(?=(?:###?\\s*Beat\\s*\\d+)|$)`, 'i');
+  const beatMatch = sectionBody.match(beatRegex);
+  if (!beatMatch) return '';
+  return beatMatch[1].trim();
 }
 
 export function getLastNWords(text = '', count = 350) {
@@ -279,12 +315,21 @@ Evaluate the drafted Beat Prose against Story Bible canon, beat boundaries, and 
         { role: 'user', content: userPrompt }
       ],
       temperature: 0.1,
+      maxTokens: 2048,
+      reasoningEffort: 'low',
       sessionId,
       workflow: 'CONTINUITY_CRITIC'
     });
 
     if (!result || typeof result !== 'object') {
-      return { passed: true, severity: 'none', issues: [] };
+      return {
+        passed: true,
+        severity: 'none',
+        issues: [],
+        skipped: true,
+        missingCanon: tier1Chunks.length === 0,
+        skipReason: 'Invalid or empty critic JSON object'
+      };
     }
 
     const issues = Array.isArray(result.issues) ? result.issues : [];
@@ -293,15 +338,19 @@ Evaluate the drafted Beat Prose against Story Bible canon, beat boundaries, and 
     return {
       passed,
       severity: result.severity || (passed ? 'none' : 'minor'),
-      issues
+      issues,
+      missingCanon: tier1Chunks.length === 0
     };
   } catch (err) {
-    // If Critic call fails, return clean pass with error recorded so workflow is not halted
+    // If Critic call fails, do not halt authoring, but mark skipped explicitly so UI warns instead of reporting false pass
     return {
       passed: true,
       severity: 'none',
       issues: [],
-      error: err.message
+      skipped: true,
+      missingCanon: tier1Chunks.length === 0,
+      error: err.message,
+      skipReason: err.message
     };
   }
 }
@@ -527,28 +576,49 @@ export async function runWriteChapterWorkflow({
       } catch {}
     }
 
-    // 1. Targeted Hybrid RAG for this Beat (retrieving all necessary files)
-    const searchTerms = [beat.characters, beat.location, beat.action, beat.goalHook, beatEditNotes].filter(Boolean).join(' ');
-    let ragChunks = [];
-    if (searchTerms.trim()) {
+    // 1. Dedicated Tier 1 Story Bible retrieval (so Tier 2 plan.md never crowds out canon)
+    // plus optional Tier 2/3 supplemental retrieval
+    const bibleQueryTerms = [beat.characters, beat.location, beat.title, (beat.action || '').slice(0, 220), beatEditNotes]
+      .filter(Boolean)
+      .join(' ');
+    let tier1 = [];
+    let tier2 = [];
+    if (bibleQueryTerms.trim()) {
       try {
-        const queryVector = await embedder.embedQuery(searchTerms);
-        const candidates = await vectorStore.hybridSearch({
-          queryText: searchTerms,
+        const queryVector = await embedder.embedQuery(bibleQueryTerms);
+        const bibleCandidates = await vectorStore.hybridSearch({
+          queryText: bibleQueryTerms,
           queryVector,
           vectorTopK: 15,
-          bm25TopK: 15
+          bm25TopK: 15,
+          sourceTypes: ['story-bible'],
+          authorityTiers: [1]
         });
-        ragChunks = await reranker.rerank({
-          queryText: searchTerms,
-          candidates,
+        const rerankedBible = await reranker.rerank({
+          queryText: bibleQueryTerms,
+          candidates: bibleCandidates,
           topK: 5
         });
+        tier1 = rerankedBible.filter((c) => Number(c.authority_tier) === 1);
+
+        const supplementalCandidates = await vectorStore.hybridSearch({
+          queryText: bibleQueryTerms,
+          queryVector,
+          vectorTopK: 10,
+          bm25TopK: 10,
+          sourceTypes: ['chapter', 'chapter-summary', 'condensed-story-so-far', 'conversation'],
+          authorityTiers: [2, 3]
+        });
+        if (supplementalCandidates && supplementalCandidates.length > 0) {
+          const rerankedSupp = await reranker.rerank({
+            queryText: bibleQueryTerms,
+            candidates: supplementalCandidates,
+            topK: 3
+          });
+          tier2 = rerankedSupp.filter((c) => Number(c.authority_tier) === 2);
+        }
       } catch {}
     }
-
-    const tier1 = ragChunks.filter((c) => Number(c.authority_tier) === 1);
-    const tier2 = ragChunks.filter((c) => Number(c.authority_tier) === 2);
 
     // 2. Continuity Window: Sliced strictly before target beat
     const lastProseSnippet = await getProseBeforeBeat(chapterFile, beat.num, tailWordLimit);
@@ -583,7 +653,8 @@ export async function runWriteChapterWorkflow({
       activeBeatNum: beat.num,
       beatsList: beats,
       cwd,
-      chapterFile
+      chapterFile,
+      tailWordLimit
     });
 
     const activeLastSnippet = lastProseSnippet || tailSnippet;
@@ -591,6 +662,13 @@ export async function runWriteChapterWorkflow({
     const activeStyle = config.enhancedWritingStyle
       ? config.enhancedWritingStyle.trim()
       : (config.writingStyle || '');
+
+    const profile = getExecutionProfile(isRevision ? 'EDIT_BEAT' : 'WRITE_BEAT', config);
+    const creativityDirective = buildCreativityDirective('off');
+    const writeTemp = profile.temperatureWrite;
+    const reasoningEffort = profile.reasoningEffort;
+    const maxTokens = profile.maxTokens;
+    const beatClarifications = parseBeatClarifications(planContent, beat.num);
 
     const globalInstructionsBlock = instructions && instructions.trim()
       ? (activeStyle && !instructions.includes(activeStyle)
@@ -602,10 +680,21 @@ export async function runWriteChapterWorkflow({
     const systemPrompt = `You are an acclaimed novelist writing narrative prose for a novel chapter.
 You write ONE BEAT at a time with uncompromising psychological depth, sensory immersion, and scene grounding.
 
+<instruction_precedence>
+Hierarchy of Authority:
+1. Beat-Specific Instructions (Highest Precedence — exact tone, pacing, and camera directives for this active beat)
+2. Chapter-Level Instructions (Middle Precedence — chapter-wide tension and pacing rules)
+3. Global Writing Style (Global Baseline Style)
+
+Truth Precedence: Specific Past Chapters & Manuscript Progress override global Story Bible lore when resolving continuity.
+</instruction_precedence>
+
 <global_writing_instructions>
 ${globalInstructionsBlock}
 </global_writing_instructions>
 ${chapterInstructions ? `\n<chapter_writing_instructions>\n${chapterInstructions}\n</chapter_writing_instructions>\n` : ''}
+${creativityDirective}
+
 ${WRITE_BEAT_SYSTEM_PROMPT}`;
 
     let revisionBlock = '';
@@ -665,10 +754,10 @@ ${downstreamContext ? `\n${downstreamContext}` : ''}
 - **Beat Number:** ${beat.num}
 - **Beat Title:** ${beat.title}
 - **Characters Present:** ${beat.characters || 'Unspecified'}
-- **Location:** ${beat.location || 'Unspecified'}
-- **Action & Event:** ${beat.action || 'Unspecified'}
-- **Goal / Scene Hook:** ${beat.goalHook || 'Unspecified'}
-${beat.instructions ? `- **Beat Writing Instructions:** ${beat.instructions}\n` : ''}${foresightBlock ? `\n${foresightBlock}\n` : ''}${revisionBlock ? `\n${revisionBlock}` : ''}
+- **Setting:** ${beat.setting || beat.location || 'Unspecified'}
+- **Beat Outline (Deterministic Events & Verbatim Dialogue):**
+${beat.beatOutline || beat.action || 'Unspecified'}
+${(beat.authorNotes || beat.goalHook) ? `- **Author's Notes (Supreme Vision for this Beat):**\n${beat.authorNotes || beat.goalHook}\n` : ''}${beat.instructions ? `- **Beat Instructions:** ${beat.instructions}\n` : ''}${beatClarifications ? `\n<beat_author_clarifications>\n${beatClarifications}\n</beat_author_clarifications>\n` : ''}${foresightBlock ? `\n${foresightBlock}\n` : ''}${revisionBlock ? `\n${revisionBlock}` : ''}
 ${retryFeedback ? `\n### Revision Notes (from previous attempt):\n${retryFeedback}\n` : ''}
 ${isRevision ? `Write the revised and improved narrative prose for Beat ${beat.num}.` : `Write the continuous narrative prose for Beat ${beat.num}.`}`;
 
@@ -690,7 +779,11 @@ ${isRevision ? `Write the revised and improved narrative prose for Beat ${beat.n
             { role: 'system', content: systemPrompt },
             { role: 'user', content: dynamicUserPrompt }
           ],
-          temperature: config.generation?.temperatureWrite || 0.75,
+          temperature: writeTemp,
+          maxTokens,
+          reasoningEffort,
+          sessionId: `chapter_${chapterNum}_beat_${beat.num}`,
+          workflow: isRevision ? 'EDIT_BEAT' : 'WRITE_BEAT',
           onChunk: (delta) => {
             process.stdout.write(delta);
           }
@@ -726,8 +819,14 @@ ${isRevision ? `Write the revised and improved narrative prose for Beat ${beat.n
             sessionId: `chapter_${chapterNum}_beat_${beat.num}`
           });
 
-          if (criticResult.passed || !criticResult.issues || criticResult.issues.length === 0) {
-            criticSpinner.succeed(chalk.green('Continuity Critic: Passed (0 canon or timeline contradictions detected)'));
+          if (criticResult.skipped) {
+            criticSpinner.warn(chalk.yellow(`Continuity Critic skipped (${criticResult.skipReason || 'API/JSON error'}) — review manually.`));
+          } else if (criticResult.passed || !criticResult.issues || criticResult.issues.length === 0) {
+            if (criticResult.missingCanon) {
+              criticSpinner.warn(chalk.yellow('Continuity Critic: Passed beat check, but 0 Story Bible canon chunks were retrieved.'));
+            } else {
+              criticSpinner.succeed(chalk.green('Continuity Critic: Passed (0 canon or timeline contradictions detected)'));
+            }
           } else {
             criticSpinner.warn(chalk.yellow(`Continuity Critic: ${criticResult.issues.length} issue(s) flagged (${criticResult.severity})`));
             console.log(chalk.yellow.bold(`\n⚠ Continuity Critic Flagged ${criticResult.issues.length} Issue(s) [Severity: ${criticResult.severity}]:`));
@@ -847,13 +946,19 @@ export async function generateChapterSummary({
     // Strip beat comments for clean summary
     const cleanProse = rawProse.replace(/<!-- BEAT \d+ -->/g, '').trim();
 
+    const creativity = config?.generation?.creativity || config?.creativity || 'medium';
+    const temps = getCreativityTemperatures(creativity);
+    const summaryTemp = temps.temperatureSummaries;
+
     const summaryText = await groqClient.chatCompletion({
       model: 'small',
       messages: [
         { role: 'system', content: CHAPTER_SUMMARY_SYSTEM_PROMPT },
         { role: 'user', content: `Chapter ${chapterNum} Full Manuscript:\n\n${cleanProse}` }
       ],
-      temperature: 0.3,
+      temperature: summaryTemp,
+      maxTokens: 2048,
+      reasoningEffort: 'low',
       sessionId: `chapter_${chapterNum}`,
       workflow: 'CHAPTER_SUMMARY'
     });
@@ -939,7 +1044,7 @@ export async function runFullChapterEditWorkflow({
   console.log(chalk.bold.magenta(`========================================`));
   console.log(chalk.dim(`  Editorial Direction: ${editInstructions}\n`));
 
-  // RAG for chapter
+  // Scoped Story Bible RAG for chapter revision
   let ragChunks = [];
   try {
     const queryVector = await embedder.embedQuery(editInstructions);
@@ -947,7 +1052,9 @@ export async function runFullChapterEditWorkflow({
       queryText: editInstructions,
       queryVector,
       vectorTopK: 15,
-      bm25TopK: 15
+      bm25TopK: 15,
+      sourceTypes: ['story-bible'],
+      authorityTiers: [1]
     });
     ragChunks = await reranker.rerank({
       queryText: editInstructions,
@@ -1002,6 +1109,7 @@ Revise and polish Chapter ${chapterNum} according to the editorial direction. El
 
   process.stdout.write(chalk.bold.green(`\nGenerating revised Chapter ${chapterNum} manuscript:\n\n`));
 
+  const editProfile = getExecutionProfile('EDIT_CHAPTER', config);
   let revisedChapter = '';
   try {
     revisedChapter = await groqClient.streamChatCompletion({
@@ -1010,7 +1118,11 @@ Revise and polish Chapter ${chapterNum} according to the editorial direction. El
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt }
       ],
-      temperature: config.generation?.temperatureWrite || 0.7,
+      temperature: editProfile.temperatureWrite,
+      maxTokens: 8192,
+      reasoningEffort: editProfile.reasoningEffort,
+      sessionId: `chapter_${chapterNum}`,
+      workflow: 'EDIT_CHAPTER',
       onChunk: (delta) => {
         process.stdout.write(delta);
       }
@@ -1039,6 +1151,7 @@ Revise and polish Chapter ${chapterNum} according to the editorial direction. El
     await createBackup(chapterFile, cwd);
     // Parse beats to ensure ordering is guaranteed
     const { header, beatsMap } = parseChapterBeats(review.content);
+    const planBeats = planContent ? parseBeatsFromPlan(planContent) : [];
     if (beatsMap.size > 0) {
       await fs.writeFile(chapterFile, serializeChapterBeats(header, beatsMap), 'utf8');
 
@@ -1046,10 +1159,11 @@ Revise and polish Chapter ${chapterNum} according to the editorial direction. El
       const condenseSpinner = createSpinner(`Re-condensing ${beatsMap.size} revised beats with 20B model...`).start();
       try {
         for (const [beatNum, beatProse] of beatsMap.entries()) {
+          const matchedPlanBeat = planBeats.find((b) => b.num === beatNum);
           await saveCondensedBeatProse({
             chapterNum,
             beatNum,
-            beatTitle: `Scene ${beatNum}`,
+            beatTitle: matchedPlanBeat?.title || `Scene ${beatNum}`,
             proseText: beatProse,
             groqClient,
             cwd,

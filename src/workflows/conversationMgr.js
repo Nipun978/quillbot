@@ -105,9 +105,15 @@ export class ConversationManager {
           { role: 'user', content: userPrompt }
         ],
         temperature: 0.3,
+        maxTokens: 2048,
+        reasoningEffort: 'low',
         sessionId: this.current.id,
         workflow: 'COMPRESS_CONVERSATION_TURNS'
       });
+
+      if (!compressed || !compressed.trim()) {
+        return;
+      }
 
       this.current.rollingSummary = compressed.trim();
       this.current.turns = remaining;
