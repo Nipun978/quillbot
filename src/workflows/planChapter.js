@@ -47,7 +47,8 @@ async function retrieveScopedPlanContext({
   vectorStore,
   reranker,
   topKBible = 5,
-  topKSupp = 3
+  topKSupp = 3,
+  isPaid = false
 }) {
   if (!searchQuery || !searchQuery.trim() || !embedder || !vectorStore || !reranker) {
     return { tier1: [], tier2: [], tier3: [] };
@@ -59,8 +60,9 @@ async function retrieveScopedPlanContext({
       queryVector,
       vectorTopK: 15,
       bm25TopK: 15,
-      sourceTypes: ['story-bible'],
-      authorityTiers: [1]
+      sourceTypes: isPaid ? ['story-bible', 'story-bible-reference'] : ['story-bible'],
+      authorityTiers: [1],
+      isPaid
     });
     const rerankedBible = await reranker.rerank({
       queryText: searchQuery,
@@ -78,7 +80,8 @@ async function retrieveScopedPlanContext({
         vectorTopK: 10,
         bm25TopK: 10,
         sourceTypes: ['chapter', 'chapter-summary', 'condensed-story-so-far', 'conversation'],
-        authorityTiers: [2, 3]
+        authorityTiers: [2, 3],
+        isPaid
       });
       if (suppCandidates && suppCandidates.length > 0) {
         const rerankedSupp = await reranker.rerank({
@@ -219,11 +222,18 @@ export async function runEditSingleBeatPlanWorkflow({
   ensureStdinRaw();
   if (!guidance && process.stdin.isTTY) {
     try {
-      guidance = await input({
+      const beatEvents = await input({
         message: isEditingExisting
           ? `What changes or improvements would you like for Beat ${targetNum}? (Press Enter for dramatic polish):`
-          : `What should happen in Beat ${targetNum}? (Brief ideas or press Enter for AI direction):`
+          : `What should happen in Beat ${targetNum}? (Brief ideas, plot action, or press Enter for AI direction):`
       });
+      const beatNotes = await input({
+        message: `Paste any author notes, dialogue lines, or beat instructions for Beat ${targetNum} (or press Enter to skip):`
+      });
+      guidance = [
+        beatEvents?.trim() ? `Beat Events & Outline:\n${beatEvents.trim()}` : '',
+        beatNotes?.trim() ? `Author's Notes & Instructions:\n${beatNotes.trim()}` : ''
+      ].filter(Boolean).join('\n\n');
     } catch {}
   }
 
@@ -235,11 +245,13 @@ export async function runEditSingleBeatPlanWorkflow({
     .filter(Boolean)
     .join(' ') || `Chapter ${chapterNum} Beat ${targetNum}`;
 
+  const isPaid = Boolean(config?.apiTier === 'paid' || config?.apiTier === 'developer');
   const { tier1, tier2, tier3 } = await retrieveScopedPlanContext({
     searchQuery,
     embedder,
     vectorStore,
-    reranker
+    reranker,
+    isPaid
   });
 
   spinner.succeed('Context assembled.');
@@ -308,7 +320,7 @@ Generate the streamlined planning blueprint for Beat ${targetNum} matching:
 ### Beat ${targetNum}: [Short Beat Title]
 - **Characters:** [Comma-separated character names matching Story Bible]
 - **Setting:** [Location and time/environment]
-- **Beat Outline:** [Concise, deterministic narrative progression containing ONLY details the author specified. Include author's verbatim dialogue in quotes. If the encounter is non-verbal/silent, state that no words are spoken—NEVER invent greetings, small-talk, or spoken dialogue not indicated by the author.]
+- **Beat Outline:** [Concise, deterministic narrative progression containing ONLY details the author specified. Spoken dialogue must be tagged simply as Speaker to Listener (how): "Verbatim line" (e.g. Debu to Padma (lightly): "You again."). If non-verbal/silent, state Non-verbal / silent interaction: [description]. Never invent greetings, small-talk, or untagged dialogue.]
 - **Author's Notes:** [Captures how and what the author wants to achieve: the emotional texture, subtext, and creative vision for this specific beat.]
 - **Beat Instructions:** [Concise beat-level prose directives: pacing, tone, and emotional distance. NO camera/screenplay jargon.]`;
 
@@ -473,6 +485,7 @@ export async function runPlanChapterWorkflow({
   } catch {}
 
   const existingBeats = hasExistingPlan ? parseBeatsFromPlan(existingPlan) : [];
+  let startWritingAfterPlan = false;
 
   // If user explicitly targeted a beat (number or 'add'):
   if (targetBeatNum !== null) {
@@ -592,11 +605,18 @@ export async function runPlanChapterWorkflow({
   ensureStdinRaw();
   if (!guidance && process.stdin.isTTY) {
     try {
-      guidance = await input({
+      const chEvents = await input({
         message: isEditingFullPlan
           ? `What changes or improvements would you like to make to Chapter ${chapterNum} plan? (Press Enter for structural polish):`
-          : `What happens in Chapter ${chapterNum}? (Brief ideas, character focus, or press Enter for AI direction):`
+          : `What happens in Chapter ${chapterNum}? (Brief ideas, plot action, or press Enter for AI direction):`
       });
+      const chNotes = await input({
+        message: `Paste any author notes, constraints, or chapter instructions for Chapter ${chapterNum} (or press Enter to skip):`
+      });
+      guidance = [
+        chEvents?.trim() ? `Chapter Events & Plot Direction:\n${chEvents.trim()}` : '',
+        chNotes?.trim() ? `Author's Notes & Chapter Instructions:\n${chNotes.trim()}` : ''
+      ].filter(Boolean).join('\n\n');
     } catch {}
   }
 
@@ -608,11 +628,13 @@ export async function runPlanChapterWorkflow({
 
   // Scoped Story Bible + supplemental RAG matching guidance
   const searchQuery = guidance.trim() || `Chapter ${chapterNum} plot progression and characters`;
+  const isPaid = Boolean(config?.apiTier === 'paid' || config?.apiTier === 'developer');
   const { tier1, tier2, tier3 } = await retrieveScopedPlanContext({
     searchQuery,
     embedder,
     vectorStore,
-    reranker
+    reranker,
+    isPaid
   });
 
   spinner.succeed('Context assembled.');
@@ -730,9 +752,16 @@ Draft the Chapter Title, Chapter Summary (1-2 paragraphs), and Chapter Instructi
       ensureStdinRaw();
       if (process.stdin.isTTY) {
         try {
-          beatGuidance = await input({
-            message: `What should happen in Beat ${currentBeatNum}? (Brief ideas or press Enter for AI direction):`
+          const beatEvents = await input({
+            message: `What should happen in Beat ${currentBeatNum}? (Brief ideas, plot action, or press Enter for AI direction):`
           });
+          const beatNotes = await input({
+            message: `Paste any author notes, dialogue lines, or beat instructions for Beat ${currentBeatNum} (or press Enter to skip):`
+          });
+          beatGuidance = [
+            beatEvents?.trim() ? `Beat Events & Plot Outline:\n${beatEvents.trim()}` : '',
+            beatNotes?.trim() ? `Author's Notes & Beat Instructions:\n${beatNotes.trim()}` : ''
+          ].filter(Boolean).join('\n\n');
         } catch {}
       }
 
@@ -764,7 +793,8 @@ Draft the Chapter Title, Chapter Summary (1-2 paragraphs), and Chapter Instructi
           vectorStore,
           reranker,
           topKBible: 5,
-          topKSupp: 0
+          topKSupp: 0,
+          isPaid
         });
         if (beatRag.tier1.length > 0) {
           const seenIds = new Set(beatRag.tier1.map((c) => c.id));
@@ -814,7 +844,7 @@ Generate the streamlined planning blueprint for Beat ${currentBeatNum} matching:
 ### Beat ${currentBeatNum}: [Short Beat Title]
 - **Characters:** [Comma-separated character names matching Story Bible]
 - **Setting:** [Location and time/environment]
-- **Beat Outline:** [Concise, deterministic narrative progression containing ONLY details the author specified. Include author's verbatim dialogue in quotes. If the encounter is non-verbal/silent, state that no words are spoken—NEVER invent greetings, small-talk, or spoken dialogue not indicated by the author.]
+- **Beat Outline:** [Concise, deterministic narrative progression containing ONLY details the author specified. Spoken dialogue must be tagged simply as Speaker to Listener (how): "Verbatim line" (e.g. Debu to Padma (lightly): "You again."). If non-verbal/silent, state Non-verbal / silent interaction: [description]. Never invent greetings, small-talk, or untagged dialogue.]
 - **Author's Notes:** [Captures how and what the author wants to achieve: the emotional texture, subtext, and creative vision for this specific beat.]
 - **Beat Instructions:** [Concise beat-level prose directives: pacing, tone, and emotional distance. NO camera/screenplay jargon.]`;
 
@@ -891,19 +921,31 @@ Generate the streamlined planning blueprint for Beat ${currentBeatNum} matching:
 
           console.log(chalk.green(`\nBeat ${currentBeatNum} saved into project/chapter-${padded}/plan.md`));
 
-          // Ask to continue or finish
-          if (currentBeatNum >= 2 && process.stdin.isTTY) {
+          // Ask to continue, write, finish, or pause
+          if (currentBeatNum >= 1 && process.stdin.isTTY) {
             ensureStdinRaw();
             try {
               const nextChoice = await select({
                 message: `Beat ${currentBeatNum} planned. What would you like to do next?`,
                 choices: [
                   { name: `Plan Beat ${currentBeatNum + 1}`, value: 'next' },
-                  { name: `Finish Chapter ${chapterNum} Plan (${currentBeatNum} beats total)`, value: 'finish' }
+                  { name: `Start Writing Chapter ${chapterNum} (Write Beat 1)`, value: 'write' },
+                  { name: `Finish Chapter ${chapterNum} Plan (${currentBeatNum} beat(s) total)`, value: 'finish' },
+                  { name: `Pause and return to prompt`, value: 'pause' }
                 ]
               });
               if (nextChoice === 'finish') {
                 continuePlanningBeats = false;
+              } else if (nextChoice === 'write') {
+                startWritingAfterPlan = true;
+                continuePlanningBeats = false;
+              } else if (nextChoice === 'pause') {
+                continuePlanningBeats = false;
+                try {
+                  await syncAllFiles({ cwd, vectorStore, embedder, config });
+                } catch {}
+                console.log(chalk.yellow(`\nPlanning paused at Beat ${currentBeatNum}. Progress saved in project/chapter-${padded}/plan.md. Resume with /plan ${chapterNum}`));
+                return;
               } else {
                 currentBeatNum++;
               }
@@ -1117,5 +1159,20 @@ ${finalPlan.trim()}`;
     syncSpinner.succeed('Chapter plan indexed.');
   } catch (err) {
     syncSpinner.fail(`Indexing failed: ${err.message}`);
+  }
+
+  if (startWritingAfterPlan) {
+    console.log(chalk.bold.green(`\nTransitioning to write Chapter ${chapterNum} Beat 1...`));
+    const { runWriteChapterWorkflow } = await import('./writeChapter.js');
+    await runWriteChapterWorkflow({
+      chapterArg: String(chapterNum),
+      cwd,
+      groqClient,
+      vectorStore,
+      embedder,
+      reranker,
+      conversationMgr,
+      config
+    });
   }
 }

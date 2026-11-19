@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { input } from '@inquirer/prompts';
+import { input, select } from '@inquirer/prompts';
 import chalk from 'chalk';
 import {
   INIT_OVERVIEW_SYSTEM_PROMPT,
@@ -11,7 +11,7 @@ import {
   buildCreativityDirective
 } from '../llm/prompts.js';
 import { createSpinner, printMarkdown } from '../ui/renderer.js';
-import { promptReviewWorkflow, openInEditor } from '../ui/reviewPrompt.js';
+import { promptReviewWorkflow, openInEditor, hotkeySelect } from '../ui/reviewPrompt.js';
 import { syncAllFiles } from '../rag/fileSync.js';
 import { saveConfig, updateInstructionsFile, enhanceWritingStyleWithAi, getCreativityTemperatures, getExecutionProfile } from '../config/configManager.js';
 import { ensureCondensedDirectories } from '../config/condensedManager.js';
@@ -45,6 +45,169 @@ async function generateCondensedSummary(text, label, groqClient, temperature = 0
   } catch {
     return text.slice(0, 250).replace(/\n+/g, ' ');
   }
+}
+
+export async function loadReferenceMaterialsContext(cwd = process.cwd(), config = {}) {
+  const isPaid = config?.apiTier === 'paid' || config?.apiTier === 'developer';
+  if (!isPaid) return '';
+
+  const refDir = path.join(cwd, 'story-bible', 'references');
+  try {
+    const files = await fs.readdir(refDir);
+    const mdFiles = files.filter((f) => f.endsWith('.md') || f.endsWith('.txt'));
+    if (mdFiles.length === 0) return '';
+    const docs = [];
+    for (const file of mdFiles) {
+      try {
+        const text = await fs.readFile(path.join(refDir, file), 'utf8');
+        if (text && text.trim()) {
+          docs.push(`### Reference: ${file}\n${text.trim()}`);
+        }
+      } catch {}
+    }
+    return docs.join('\n\n');
+  } catch {
+    return '';
+  }
+}
+
+export async function promptAndIngestReferenceMaterials({
+  cwd = process.cwd(),
+  vectorStore,
+  embedder,
+  config = {}
+}) {
+  const isPaid = config?.apiTier === 'paid' || config?.apiTier === 'developer';
+  if (!isPaid) {
+    return [];
+  }
+
+  const refDir = path.join(cwd, 'story-bible', 'references');
+  await fs.mkdir(refDir, { recursive: true });
+
+  let addMore = true;
+  let firstPrompt = true;
+  const ingestedFiles = [];
+
+  while (addMore) {
+    ensureStdinRaw();
+    const answer = await hotkeySelect({
+      message: firstPrompt
+        ? 'Do you have any other reference materials or source notes to include?'
+        : 'Add another reference material?',
+      choices: [
+        { key: 'n', keys: ['n', 'a', 'c'], name: '[N]o  - Continue to Story Bible generation', value: 'n' },
+        { key: 'y', name: '[Y]es - Add reference material (file / paste / editor)', value: 'y' }
+      ],
+      cooldownSeconds: 0,
+      isPaid: true
+    });
+
+    if (answer !== 'y') {
+      addMore = false;
+      break;
+    }
+
+    firstPrompt = false;
+
+    // 3 choices: file, paste, editor
+    ensureStdinRaw();
+    const mode = await select({
+      message: 'How would you like to provide this reference material?',
+      choices: [
+        { name: '1. Choose an existing file (path from disk)', value: 'file' },
+        { name: '2. Paste directly in terminal', value: 'paste' },
+        { name: '3. Open in configured editor to paste/type', value: 'editor' }
+      ]
+    });
+
+    let refContent = '';
+    let suggestedName = '';
+
+    if (mode === 'file') {
+      ensureStdinRaw();
+      const filePath = await input({
+        message: 'Enter the path to your reference file (.md, .txt, etc.):'
+      });
+      const trimmed = filePath.trim().replace(/^['"]|['"]$/g, '');
+      const resolvedPath = path.isAbsolute(trimmed) ? trimmed : path.resolve(cwd, trimmed);
+      try {
+        refContent = await fs.readFile(resolvedPath, 'utf8');
+        suggestedName = path.basename(resolvedPath, path.extname(resolvedPath));
+      } catch (err) {
+        console.log(chalk.red(`Could not read file at "${resolvedPath}": ${err.message}`));
+        continue;
+      }
+    } else if (mode === 'paste') {
+      if (process.stdin.isTTY) {
+        console.log(chalk.cyan('Type or paste your reference text. Type END on a new line and press Enter when finished:'));
+        const lines = [];
+        const rl = (await import('node:readline')).createInterface({
+          input: process.stdin,
+          output: process.stdout
+        });
+        for await (const line of rl) {
+          if (line.trim() === 'END') break;
+          lines.push(line);
+        }
+        refContent = lines.join('\n').trim();
+      } else {
+        ensureStdinRaw();
+        const rawText = await input({
+          message: 'Paste your reference text:'
+        });
+        refContent = rawText ? rawText.trim() : '';
+      }
+    } else if (mode === 'editor') {
+      const template = `# Reference Notes\n\nPaste or type your reference material here. Save and close the editor when finished.\n`;
+      try {
+        const edited = await openInEditor(template, config.editor);
+        if (edited && edited.trim() && edited.trim() !== template.trim()) {
+          refContent = edited.trim();
+        } else {
+          console.log(chalk.yellow('No reference material entered in editor.'));
+          continue;
+        }
+      } catch (err) {
+        console.log(chalk.red(`Failed to open editor: ${err.message}`));
+        continue;
+      }
+    }
+
+    if (!refContent || !refContent.trim()) {
+      console.log(chalk.yellow('Reference content was empty. Skipping.'));
+      continue;
+    }
+
+    // Name the reference file
+    ensureStdinRaw();
+    const titlePrompt = await input({
+      message: 'Enter a short title/name for this reference document:',
+      default: suggestedName || `reference-${ingestedFiles.length + 1}`
+    });
+    const sanitizedTitle = (titlePrompt || `reference-${ingestedFiles.length + 1}`)
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, '-')
+      .replace(/^-+|-+$/g, '') || `reference-${Date.now()}`;
+    const targetPath = path.join(refDir, `${sanitizedTitle}.md`);
+
+    await fs.writeFile(targetPath, refContent.trim() + '\n', 'utf8');
+    ingestedFiles.push(targetPath);
+    console.log(chalk.green(`✓ Saved reference material to story-bible/references/${sanitizedTitle}.md`));
+  }
+
+  // If any references were ingested, sync them immediately to LanceDB Hybrid RAG
+  if (ingestedFiles.length > 0 && vectorStore && embedder) {
+    const syncSpinner = createSpinner(`Chunking and indexing ${ingestedFiles.length} reference document(s) with Hybrid RAG...`).start();
+    try {
+      await syncAllFiles({ cwd, vectorStore, embedder, config });
+      syncSpinner.succeed(`Indexed ${ingestedFiles.length} reference document(s) into LanceDB (Authority Tier 1).`);
+    } catch (err) {
+      syncSpinner.warn(`LanceDB indexing warning: ${err.message}`);
+    }
+  }
+
+  return ingestedFiles;
 }
 
 export async function runInitProjectWorkflow({
@@ -195,6 +358,26 @@ ${synopsis.trim()}`;
   await fs.mkdir(bibleDir, { recursive: true });
   await ensureCondensedDirectories(cwd);
 
+  // Step 0b: Reference Materials (Paid Tier Only)
+  const isPaid = config?.apiTier === 'paid' || config?.apiTier === 'developer';
+  if (isPaid) {
+    await promptAndIngestReferenceMaterials({
+      cwd,
+      vectorStore,
+      embedder,
+      config
+    });
+  }
+
+  const referenceContext = await loadReferenceMaterialsContext(cwd, config);
+  if (referenceContext && isPaid) {
+    console.log(chalk.cyan('Incorporating author reference material(s) into Story Bible generation.'));
+  }
+
+  const fidelityDirective = (isPaid && referenceContext)
+    ? '(Fidelity Directive: Strict zero-hallucination. Record ONLY events, factions, and constraints explicitly present in the synopsis, author clarifications, or author reference materials. For omitted categories, state "Not specified by author".)'
+    : '(Fidelity Directive: Strict zero-hallucination. Record ONLY events, factions, and constraints explicitly present in the synopsis or author clarifications. For omitted categories, state "Not specified by author".)';
+
   const activeStyle = config.enhancedWritingStyle
     ? config.enhancedWritingStyle.trim()
     : (config.writingStyle || '');
@@ -220,10 +403,11 @@ ${synopsis.trim()}`;
 Thematic Tone & Setting Palette:
 ${config.writingStyle || 'Atmospheric, grounded, psychologically nuanced'}
 (Format Directive: Maintain strictly objective, third-person archival prose. Do NOT write in first-person 'I'.)
+${fidelityDirective}
 
 Story Synopsis:
 ${synopsis.trim()}
-${authorClarifications ? `\n<author_clarifications>\n${authorClarifications}\n</author_clarifications>` : ''}
+${authorClarifications ? `\n<author_clarifications>\n${authorClarifications}\n</author_clarifications>` : ''}${isPaid && referenceContext ? `\n<author_reference_materials>\n${referenceContext}\n</author_reference_materials>` : ''}
 
 ${creativityDirective}
 ${overviewFeedback ? `\nRevision Feedback from author:\n${overviewFeedback}` : ''}`;
@@ -298,10 +482,11 @@ ${overviewFeedback ? `\nRevision Feedback from author:\n${overviewFeedback}` : '
 Thematic Tone & Setting Palette:
 ${config.writingStyle || 'Atmospheric, grounded, psychologically nuanced'}
 (Format Directive: Maintain strictly objective, third-person archival prose. Do NOT write in first-person 'I'.)
+${fidelityDirective}
 
 Story Synopsis:
 ${synopsis.trim()}
-${authorClarifications ? `\n<author_clarifications>\n${authorClarifications}\n</author_clarifications>` : ''}
+${authorClarifications ? `\n<author_clarifications>\n${authorClarifications}\n</author_clarifications>` : ''}${isPaid && referenceContext ? `\n<author_reference_materials>\n${referenceContext}\n</author_reference_materials>` : ''}
 
 <condensed_plot_overview>
 ${condensedOverview}
@@ -380,10 +565,11 @@ ${charactersFeedback ? `\nRevision Feedback from author:\n${charactersFeedback}`
 Thematic Tone & Setting Palette:
 ${config.writingStyle || 'Atmospheric, grounded, psychologically nuanced'}
 (Format Directive: Maintain strictly objective, third-person archival prose. Do NOT write in first-person 'I'.)
+${fidelityDirective}
 
 Story Synopsis:
 ${synopsis.trim()}
-${authorClarifications ? `\n<author_clarifications>\n${authorClarifications}\n</author_clarifications>` : ''}
+${authorClarifications ? `\n<author_clarifications>\n${authorClarifications}\n</author_clarifications>` : ''}${isPaid && referenceContext ? `\n<author_reference_materials>\n${referenceContext}\n</author_reference_materials>` : ''}
 
 <condensed_narrative_context>
 ${condensedOverview}
@@ -466,10 +652,11 @@ ${locationsFeedback ? `\nRevision Feedback from author:\n${locationsFeedback}` :
 Thematic Tone & Setting Palette:
 ${config.writingStyle || 'Atmospheric, grounded, psychologically nuanced'}
 (Format Directive: Maintain strictly objective, third-person archival prose. Do NOT write in first-person 'I'.)
+${fidelityDirective}
 
 Story Synopsis:
 ${synopsis.trim()}
-${authorClarifications ? `\n<author_clarifications>\n${authorClarifications}\n</author_clarifications>` : ''}
+${authorClarifications ? `\n<author_clarifications>\n${authorClarifications}\n</author_clarifications>` : ''}${isPaid && referenceContext ? `\n<author_reference_materials>\n${referenceContext}\n</author_reference_materials>` : ''}
 
 <condensed_narrative_context>
 ${condensedOverview}

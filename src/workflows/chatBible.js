@@ -242,17 +242,19 @@ async function runRagConsultation({
 
   let rerankedChunks = [];
   try {
+    const isPaid = config?.apiTier === 'paid' || config?.apiTier === 'developer';
     const queryVector = await embedder.embedQuery(improvisedQuery);
     const searchOpts = {
       queryText: improvisedQuery,
       queryVector,
       vectorTopK: config?.rag?.vectorTopK || 15,
       bm25TopK: config?.rag?.bm25TopK || 15,
-      rrfK: config?.rag?.rrfK || 60
+      rrfK: config?.rag?.rrfK || 60,
+      isPaid
     };
 
     if (isBibleScope) {
-      searchOpts.sourceTypes = ['story-bible'];
+      searchOpts.sourceTypes = isPaid ? ['story-bible', 'story-bible-reference'] : ['story-bible'];
       searchOpts.authorityTiers = [1];
     }
 
@@ -266,11 +268,20 @@ async function runRagConsultation({
     });
 
     if (isBibleScope) {
-      rerankedChunks = rerankedChunks.filter(
-        (c) => c.source_type === 'story-bible' ||
+      rerankedChunks = rerankedChunks.filter((c) => {
+        const isBibleDoc = c.source_type === 'story-bible' ||
+          (isPaid && c.source_type === 'story-bible-reference') ||
           Number(c.authority_tier) === 1 ||
-          String(c.source_path || '').startsWith('story-bible/')
-      );
+          String(c.source_path || '').replace(/\\/g, '/').startsWith('story-bible/');
+        const isRef = c.source_type === 'story-bible-reference' ||
+          String(c.source_path || '').replace(/\\/g, '/').startsWith('story-bible/references/');
+        return isPaid ? isBibleDoc : (isBibleDoc && !isRef);
+      });
+    } else if (!isPaid) {
+      rerankedChunks = rerankedChunks.filter((c) => (
+        c.source_type !== 'story-bible-reference' &&
+        !String(c.source_path || '').replace(/\\/g, '/').startsWith('story-bible/references/')
+      ));
     } else if (
       writtenProgress.hasWrittenContent &&
       rerankedChunks.every((c) => Number(c.authority_tier) !== 2)

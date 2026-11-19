@@ -54,7 +54,7 @@ export async function main() {
   await conversationMgr.init();
 
   // 6. Check if story-bible is empty
-  const trackedFiles = await getTrackedFiles(cwd);
+  const trackedFiles = await getTrackedFiles(cwd, config);
   const bibleFiles = trackedFiles.filter((f) => f.startsWith('story-bible/'));
 
   if (bibleFiles.length === 0) {
@@ -83,6 +83,9 @@ export async function main() {
     const syncSpinner = createSpinner('Syncing novel workspace with LanceDB...').start();
     try {
       const syncRes = await syncAllFiles({ cwd, vectorStore, embedder, config });
+      if (syncRes.omittedCount > 0) {
+        console.log(chalk.yellow(`\n[Free Tier] Omitted ${syncRes.omittedCount} file(s) not intended for free tier (references/external notes).`));
+      }
       if (syncRes.hasChanges) {
         syncSpinner.succeed(`Synced files. Indexed ${syncRes.indexedCount} chunks.`);
       } else {

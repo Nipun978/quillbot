@@ -276,7 +276,7 @@ export async function startRepl({
       // Handle Status
       if (input === '/status') {
         const state = await loadState(cwd);
-        const tracked = await getTrackedFiles(cwd);
+        const tracked = await getTrackedFiles(cwd, config);
         let rowCount = 0;
         try {
           if (vectorStore.table) {
@@ -312,7 +312,16 @@ export async function startRepl({
         const spinner = createSpinner('Running incremental sync to LanceDB...').start();
         try {
           const res = await syncAllFiles({ cwd, vectorStore, embedder, config });
-          spinner.succeed(`Sync complete. Indexed ${res.indexedCount} chunks, removed ${res.deletedCount} deleted.`);
+          if (res.omittedCount > 0) {
+            spinner.succeed(`Sync complete. Indexed ${res.indexedCount} chunks, removed ${res.deletedCount} deleted, omitted ${res.omittedCount} non-free file(s).`);
+            console.log(chalk.yellow(`\n[Free Tier] Omitted ${res.omittedCount} file(s) not intended for free tier (references/external notes):`));
+            for (const f of res.omittedFiles) {
+              console.log(chalk.dim(`  - ${f}`));
+            }
+            console.log(chalk.dim('Upgrade to paid tier to index external references and custom lore.\n'));
+          } else {
+            spinner.succeed(`Sync complete. Indexed ${res.indexedCount} chunks, removed ${res.deletedCount} deleted.`);
+          }
         } catch (err) {
           spinner.fail(`Sync error: ${err.message}`);
         }

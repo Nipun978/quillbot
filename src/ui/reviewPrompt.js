@@ -58,7 +58,11 @@ export const hotkeySelect = createPrompt((config, done) => {
 
     // 2. Single-character hotkeys
     const char = (key.name || key.sequence || '').toLowerCase();
-    const matchedChoice = choices.find((c) => c.key && c.key.toLowerCase() === char);
+    const matchedChoice = choices.find((c) => {
+      if (c.key && c.key.toLowerCase() === char) return true;
+      if (Array.isArray(c.keys) && c.keys.some((k) => k.toLowerCase() === char)) return true;
+      return false;
+    });
     if (matchedChoice) {
       if (isCooldownAction(matchedChoice.value) && countRef.current > 0) {
         const actionVerb = matchedChoice.value === 'retry' ? 'retry' : 'accept';
@@ -158,6 +162,40 @@ export async function openInEditor(initialContent = '', preferredEditor = '') {
   return editedContent;
 }
 
+export function parseIssueIndices(inputStr, totalIssues) {
+  if (!inputStr || !inputStr.trim() || inputStr.trim().toLowerCase() === 'all') {
+    return Array.from({ length: totalIssues }, (_, i) => i);
+  }
+  const selected = new Set();
+  const parts = inputStr.trim().split(/[\s,;]+/);
+  for (const part of parts) {
+    if (!part) continue;
+    if (part.toLowerCase() === 'all') {
+      for (let i = 0; i < totalIssues; i++) selected.add(i);
+      continue;
+    }
+    const rangeMatch = part.match(/^(\d+)-(\d+)$/);
+    if (rangeMatch) {
+      const start = parseInt(rangeMatch[1], 10);
+      const end = parseInt(rangeMatch[2], 10);
+      const min = Math.max(1, Math.min(start, end));
+      const max = Math.min(totalIssues, Math.max(start, end));
+      for (let i = min; i <= max; i++) {
+        selected.add(i - 1);
+      }
+    } else {
+      const num = parseInt(part, 10);
+      if (!Number.isNaN(num) && num >= 1 && num <= totalIssues) {
+        selected.add(num - 1);
+      }
+    }
+  }
+  if (selected.size === 0) {
+    return Array.from({ length: totalIssues }, (_, i) => i);
+  }
+  return Array.from(selected).sort((a, b) => a - b);
+}
+
 export async function promptReviewWorkflow({
   draftContent = '',
   itemLabel = 'draft',
@@ -237,8 +275,29 @@ export async function promptReviewWorkflow({
   }
 
   if (action === 'fix_critic') {
-    const formattedCriticFixInstructions = criticIssues.map((issue, idx) => {
-      const typeStr = issue.type ? `[${issue.type}] ` : '';
+    let targetIssues = criticIssues;
+
+    if (criticIssues.length > 1 && process.stdin.isTTY) {
+      ensureStdinRaw();
+      let issueSelection = '';
+      try {
+        issueSelection = await input({
+          message: `Select issue numbers to fix (e.g. "1 2 6", "1-4", or "all" [default: all]):`,
+          default: 'all'
+        });
+      } catch {
+        issueSelection = 'all';
+      }
+
+      const selectedIndices = parseIssueIndices(issueSelection, criticIssues.length);
+      targetIssues = selectedIndices.map((i) => criticIssues[i]).filter(Boolean);
+      if (targetIssues.length === 0) {
+        targetIssues = criticIssues;
+      }
+    }
+
+    const formattedCriticFixInstructions = targetIssues.map((issue, idx) => {
+      const typeStr = (issue.category || issue.type) ? `[${issue.category || issue.type}] ` : '';
       const quoteStr = issue.quote ? `\n- Quote: "${issue.quote}"` : '';
       const fixStr = issue.fixSuggestion ? `\n- Fix: ${issue.fixSuggestion}` : '';
       return `${idx + 1}. ${typeStr}${issue.description}${quoteStr}${fixStr}`;
@@ -247,7 +306,7 @@ export async function promptReviewWorkflow({
     return {
       action: 'retry',
       content: draftContent,
-      feedback: `Please fix the following continuity issues detected by Continuity Critic:\n\n${formattedCriticFixInstructions}`
+      feedback: `Please fix the following issues detected by Continuity & Plan Critic:\n\n${formattedCriticFixInstructions}`
     };
   }
 

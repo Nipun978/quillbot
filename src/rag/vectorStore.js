@@ -27,22 +27,65 @@ export class VectorStore {
   }
 
   async repairCorruptedIndex() {
-    console.warn('[VectorStore] Corrupted LanceDB index detected (magic number mismatch or incomplete write). Auto-repairing...');
-    await this.close();
+    if (this._isRepairing) return;
+    this._isRepairing = true;
     try {
-      await fs.rm(this.dbPath, { recursive: true, force: true });
+      console.warn('[VectorStore] Corrupted LanceDB index detected (magic number mismatch or incomplete write). Auto-repairing...');
+      await this.close();
+
+      // 1. Try standard recursive removal
+      try {
+        await fs.rm(this.dbPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      } catch {}
+
+      // 2. Check if dbPath still exists (e.g. Windows file locking or ACL issues)
+      let stillExists = false;
+      try {
+        await fs.access(this.dbPath);
+        stillExists = true;
+      } catch {}
+
+      // 3. Fallback: If removal failed, move/rename the corrupted folder out of the way
+      if (stillExists) {
+        try {
+          const corruptBackup = path.join(
+            path.dirname(this.dbPath),
+            `.corrupted_index_${Date.now()}`
+          );
+          await fs.rename(this.dbPath, corruptBackup);
+        } catch {
+          // If rename also fails, attempt to delete contents individually
+          try {
+            const items = await fs.readdir(this.dbPath);
+            for (const item of items) {
+              try {
+                await fs.rm(path.join(this.dbPath, item), { recursive: true, force: true });
+              } catch {}
+            }
+          } catch {}
+        }
+      }
+
+      // 4. Ensure fresh dbPath exists
       await fs.mkdir(this.dbPath, { recursive: true });
-    } catch {}
-    try {
-      const state = await loadState(this.cwd);
-      state.fileHashes = {};
-      await saveState(state, this.cwd);
-    } catch {}
-    try {
-      this.db = await lancedb.connect(this.dbPath);
-      this.table = null;
-    } catch {}
-    console.log('[VectorStore] LanceDB index directory reset. State file hashes cleared for re-indexing.');
+
+      // 5. Clear state hashes so all novel workspace files will be re-indexed cleanly
+      try {
+        const state = await loadState(this.cwd);
+        state.fileHashes = {};
+        await saveState(state, this.cwd);
+      } catch {}
+
+      // 6. Connect to fresh database
+      try {
+        this.db = await lancedb.connect(this.dbPath);
+        this.table = null;
+      } catch {}
+
+      console.log('[VectorStore] LanceDB index directory reset. State file hashes cleared for re-indexing.');
+    } finally {
+      this._isRepairing = false;
+    }
   }
 
   async init() {
@@ -177,11 +220,29 @@ export class VectorStore {
     }
   }
 
-  _buildWhereClause({ sourceTypes = null, authorityTiers = null } = {}) {
+  async deleteWhere(sqlCondition) {
+    if (!this.table || !sqlCondition) return;
+    try {
+      await this.table.delete(sqlCondition);
+    } catch (err) {
+      if (this._isCorruptError(err)) {
+        await this.repairCorruptedIndex();
+      }
+    }
+  }
+
+  _buildWhereClause({ sourceTypes = null, authorityTiers = null, isPaid = false } = {}) {
     const clauses = [];
     if (Array.isArray(sourceTypes) && sourceTypes.length > 0) {
-      const quoted = sourceTypes.map((t) => `'${String(t).replace(/'/g, "''")}'`).join(', ');
-      clauses.push(`source_type IN (${quoted})`);
+      const allowedTypes = isPaid
+        ? sourceTypes
+        : sourceTypes.filter((t) => t !== 'story-bible-reference');
+      if (allowedTypes.length > 0) {
+        const quoted = allowedTypes.map((t) => `'${String(t).replace(/'/g, "''")}'`).join(', ');
+        clauses.push(`source_type IN (${quoted})`);
+      }
+    } else if (!isPaid) {
+      clauses.push("source_type != 'story-bible-reference'");
     }
     if (Array.isArray(authorityTiers) && authorityTiers.length > 0) {
       const nums = authorityTiers.map((n) => Number(n)).filter((n) => !Number.isNaN(n));
@@ -200,7 +261,8 @@ export class VectorStore {
     rrfK = 60,
     authorityBoosts = { 1: 1.05, 2: 1.10, 3: 0.95 },
     sourceTypes = null,
-    authorityTiers = null
+    authorityTiers = null,
+    isPaid = false
   }) {
     if (!this.table) {
       return [];
@@ -212,7 +274,7 @@ export class VectorStore {
         return [];
       }
 
-      const whereClause = this._buildWhereClause({ sourceTypes, authorityTiers });
+      const whereClause = this._buildWhereClause({ sourceTypes, authorityTiers, isPaid });
 
       // 1. Vector Search
       let vectorHits = [];
@@ -296,15 +358,23 @@ export class VectorStore {
       // Sort descending by RRF score
       candidates.sort((a, b) => b.rrfScore - a.rrfScore);
 
+      let filtered = candidates;
+      if (!isPaid) {
+        filtered = filtered.filter((c) => (
+          c.source_type !== 'story-bible-reference' &&
+          !String(c.source_path || '').replace(/\\/g, '/').startsWith('story-bible/references/')
+        ));
+      }
+
       if ((Array.isArray(sourceTypes) && sourceTypes.length > 0) || (Array.isArray(authorityTiers) && authorityTiers.length > 0)) {
-        return candidates.filter((c) => {
+        return filtered.filter((c) => {
           const matchType = !sourceTypes?.length || sourceTypes.includes(c.source_type);
           const matchTier = !authorityTiers?.length || authorityTiers.includes(Number(c.authority_tier));
           return matchType && matchTier;
         });
       }
 
-      return candidates;
+      return filtered;
     } catch (err) {
       if (this._isCorruptError(err)) {
         await this.repairCorruptedIndex();

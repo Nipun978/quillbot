@@ -26,6 +26,13 @@ export function determineSourceMetadata(relativePath) {
   const normalized = relativePath.replace(/\\/g, '/');
 
   if (normalized.startsWith('story-bible/')) {
+    if (normalized.startsWith('story-bible/references/')) {
+      return {
+        source_type: 'story-bible-reference',
+        authority_tier: 1,
+        chapter_num: 0
+      };
+    }
     return {
       source_type: 'story-bible',
       authority_tier: 1,

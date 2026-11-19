@@ -84,6 +84,20 @@ export function parseBeatsFromPlan(planContent) {
     const authorNotes = notesMatch ? notesMatch[1].trim() : '';
     const instructions = instrMatch ? instrMatch[1].trim() : '';
 
+    // Extract inline dialogue tags: Speaker to Listener (how): "Line" or [Speaker to Listener (delivery)]: "Line"
+    const dialogueRegex = /(?:\[)?([A-Za-z0-9_\s'-]+?)\s+to\s+([A-Za-z0-9_\s'-]+?)(?:\s*\(([^)]+)\))?(?:\])?:\s*["“']([^"”']+)["”']/gi;
+    const dialogueTags = [];
+    let dMatch;
+    while ((dMatch = dialogueRegex.exec(outline)) !== null) {
+      dialogueTags.push({
+        speaker: dMatch[1].trim(),
+        listener: dMatch[2].trim(),
+        delivery: (dMatch[3] || '').trim(),
+        line: dMatch[4].trim(),
+        fullTag: dMatch[0]
+      });
+    }
+
     beats.push({
       num: indices[i].beatNum,
       title: indices[i].title,
@@ -95,6 +109,7 @@ export function parseBeatsFromPlan(planContent) {
       goalHook: authorNotes,
       authorNotes,
       instructions,
+      dialogueTags,
       rawBlock: fullBlock
     });
   }
@@ -277,6 +292,8 @@ export async function runContinuityCritic({
   pastChapterSummaries = '',
   lastProseSnippet = '',
   planContent = '',
+  chapterInstructions = '',
+  globalInstructions = '',
   groqClient,
   sessionId = 'continuity_critic'
 }) {
@@ -294,18 +311,32 @@ ${formatChunks(tier1Chunks)}
 ${pastChapterSummaries ? `Past Chapter Summaries:\n${pastChapterSummaries}\n` : ''}
 ${lastProseSnippet ? `Verbatim Preceding Scene Tail:\n"...${lastProseSnippet}"\n` : '(Opening of chapter)'}
 
-### 3. CHAPTER PLAN & TARGET BEAT:
+### 3. CHAPTER & BEAT WRITING INSTRUCTIONS:
+${chapterInstructions ? `Chapter Instructions:\n${chapterInstructions}\n` : ''}
+${beat?.instructions ? `Beat Instructions (Narrow & Specific to this Beat):\n${beat.instructions}\n` : ''}
+${globalInstructions ? `Global Writing Directives:\n${globalInstructions}\n` : ''}
+
+### 4. TARGET BEAT PLAN & AUTHOR'S NOTES:
 ${planContent ? `Full Plan:\n${planContent.trim()}\n` : ''}
 Target Beat to Verify: Beat ${beat?.num} (${beat?.title || ''})
 Required Characters: ${beat?.characters || 'Unspecified'}
-Required Location: ${beat?.location || 'Unspecified'}
-Required Action: ${beat?.action || 'Unspecified'}
-Goal/Hook: ${beat?.goalHook || 'Unspecified'}
+Required Location: ${beat?.setting || beat?.location || 'Unspecified'}
+Beat Outline (Planned Actions & Spoken Dialogue):
+${beat?.beatOutline || beat?.action || 'Unspecified'}
+Author's Notes (Author's Vision & Purpose for this Beat):
+${beat?.authorNotes || beat?.goalHook || 'Unspecified'}
 
-### 4. DRAFTED BEAT PROSE TO AUDIT:
+### 5. DRAFTED BEAT PROSE TO AUDIT:
 ${beatProse}
 
-Evaluate the drafted Beat Prose against Story Bible canon, beat boundaries, and scene continuity. Return your evaluation strictly as the JSON schema requested in your instructions.`;
+Audit the drafted Beat Prose against:
+1. Plan adherence (were planned events, character actions, and planned dialogue lines executed? Note: prose renders dialogue in standard literary novel format, NOT planning tags).
+2. Author's Notes & Purpose (was the specific emotional texture, subtext, and creative vision achieved?)
+3. Beat & Chapter Instructions adherence (were pacing, tone, and emotional distance constraints followed?)
+4. Grammar, spelling, and syntax flaws (including robotic/ungrammatical tags like "said personifying" or "said matter-of-fact")
+5. Story Bible canon and scene continuity
+
+Return your evaluation strictly as the JSON schema requested in your instructions.`;
 
   try {
     const result = await groqClient.jsonCompletion({
@@ -324,6 +355,12 @@ Evaluate the drafted Beat Prose against Story Bible canon, beat boundaries, and 
     if (!result || typeof result !== 'object') {
       return {
         passed: true,
+        checklist: {
+          planFollowed: true,
+          authorVisionMet: true,
+          instructionsFollowed: true,
+          grammarCorrect: true
+        },
         severity: 'none',
         issues: [],
         skipped: true,
@@ -332,12 +369,81 @@ Evaluate the drafted Beat Prose against Story Bible canon, beat boundaries, and 
       };
     }
 
-    const issues = Array.isArray(result.issues) ? result.issues : [];
-    const passed = Boolean(result.passed === true || issues.length === 0);
+    const rawIssues = Array.isArray(result.issues) ? result.issues : [];
+
+    // Filter out small-model hallucinations where the critic inverted the rule and told the author
+    // to replace standard prose dialogue with planning tags like "Speaker to Listener (how):"
+    const issues = rawIssues.filter((i) => {
+      const desc = (i.description || '').toLowerCase();
+      const fix = (i.fixSuggestion || '').toLowerCase();
+      if (
+        fix.includes('inline plan tag') ||
+        fix.includes('inline format') ||
+        fix.includes('required inline') ||
+        /replace.*prose dialogue.*with.*to.*:/i.test(fix) ||
+        (desc.includes('written as prose') && desc.includes('inline'))
+      ) {
+        return false;
+      }
+      return true;
+    });
+
+    const hasPlanDiscrepancyIssue = issues.some((i) => (i.category || i.type) === 'plan_discrepancy' || (i.category || i.type) === 'raw_dialogue_tags_leaked');
+    const checklist = result.checklist && typeof result.checklist === 'object' ? {
+      planFollowed: hasPlanDiscrepancyIssue ? false : Boolean(result.checklist.planFollowed !== false || !hasPlanDiscrepancyIssue),
+      authorVisionMet: Boolean(result.checklist.authorVisionMet !== false),
+      instructionsFollowed: Boolean(result.checklist.instructionsFollowed !== false),
+      grammarCorrect: Boolean(result.checklist.grammarCorrect !== false)
+    } : {
+      planFollowed: !hasPlanDiscrepancyIssue,
+      authorVisionMet: issues.every((i) => (i.category || i.type) !== 'purpose_vision'),
+      instructionsFollowed: issues.every((i) => (i.category || i.type) !== 'instructions_violation'),
+      grammarCorrect: issues.every((i) => (i.category || i.type) !== 'grammar_spelling')
+    };
+
+    // Deterministic check: detect raw planning bracket tags or planning dialogue tags that leaked into narrative prose
+    const leakedDialogueRegex = /(?:\[([^\]]+?)\s+to\s+([^\]]+?)(?:\s*\([^)]+\))?\]:\s*["“']|\[Non-verbal[^\]]*\]|^(?:[A-Za-z0-9_\s'-]+?)\s+to\s+(?:[A-Za-z0-9_\s'-]+?)(?:\s*\([^)]+\))?:\s*["“']|^Non-verbal\s*\/\s*silent interaction:)/im;
+    const leakedMatch = beatProse.match(leakedDialogueRegex);
+    if (leakedMatch) {
+      checklist.planFollowed = false;
+      const alreadyReported = issues.some((i) => i.type === 'raw_dialogue_tags_leaked' || (i.description && (i.description.includes('bracket') || i.description.includes('dialogue tag'))));
+      if (!alreadyReported) {
+        issues.unshift({
+          type: 'raw_dialogue_tags_leaked',
+          category: 'plan_discrepancy',
+          description: 'Raw planning dialogue tags detected in prose. Convert all planning dialogue tags into natural literary prose with dialogue attributions or action beats.',
+          quote: leakedMatch[0],
+          fixSuggestion: 'Remove raw planning syntax and integrate speech or physical action directly into novel prose narrative.'
+        });
+      }
+    }
+
+    // Deterministic check: detect robotic planning delivery cues pasted directly into dialogue tags
+    // e.g. "said personifying", "said matter-of-fact", "asked inquiring", "asked questioningly", "said surprised"
+    const roboticCueRegex = /\b(?:said|asked|replied|answered|whispered|murmured|muttered|spoke)\s+(?:personifying|matter-of-fact|inquiring|questioningly|surprised)\b/i;
+    const roboticMatch = beatProse.match(roboticCueRegex);
+    if (roboticMatch) {
+      checklist.grammarCorrect = false;
+      const alreadyReported = issues.some((i) => i.quote && i.quote.includes(roboticMatch[0]));
+      if (!alreadyReported) {
+        issues.push({
+          type: 'grammar_spelling',
+          category: 'grammar_spelling',
+          description: `Robotic planning delivery cue leaked into dialogue tag ("${roboticMatch[0]}"). Delivery cues are subtext directions, not literal speech adverbs.`,
+          quote: roboticMatch[0],
+          fixSuggestion: 'Express the delivery through character action beats, gestures, tone, or clean standard dialogue attributions.'
+        });
+      }
+    }
+
+    const allChecklistPassed = Object.values(checklist).every(Boolean);
+    const passed = Boolean(result.passed === true || (issues.length === 0 && allChecklistPassed)) && !leakedMatch;
+    const severity = leakedMatch ? 'major' : (result.severity || (passed ? 'none' : 'minor'));
 
     return {
       passed,
-      severity: result.severity || (passed ? 'none' : 'minor'),
+      checklist,
+      severity,
       issues,
       missingCanon: tier1Chunks.length === 0
     };
@@ -345,6 +451,12 @@ Evaluate the drafted Beat Prose against Story Bible canon, beat boundaries, and 
     // If Critic call fails, do not halt authoring, but mark skipped explicitly so UI warns instead of reporting false pass
     return {
       passed: true,
+      checklist: {
+        planFollowed: true,
+        authorVisionMet: true,
+        instructionsFollowed: true,
+        grammarCorrect: true
+      },
       severity: 'none',
       issues: [],
       skipped: true,
@@ -585,14 +697,16 @@ export async function runWriteChapterWorkflow({
     let tier2 = [];
     if (bibleQueryTerms.trim()) {
       try {
+        const isPaid = Boolean(config?.apiTier === 'paid' || config?.apiTier === 'developer');
         const queryVector = await embedder.embedQuery(bibleQueryTerms);
         const bibleCandidates = await vectorStore.hybridSearch({
           queryText: bibleQueryTerms,
           queryVector,
           vectorTopK: 15,
           bm25TopK: 15,
-          sourceTypes: ['story-bible'],
-          authorityTiers: [1]
+          sourceTypes: isPaid ? ['story-bible', 'story-bible-reference'] : ['story-bible'],
+          authorityTiers: [1],
+          isPaid
         });
         const rerankedBible = await reranker.rerank({
           queryText: bibleQueryTerms,
@@ -607,7 +721,8 @@ export async function runWriteChapterWorkflow({
           vectorTopK: 10,
           bm25TopK: 10,
           sourceTypes: ['chapter', 'chapter-summary', 'condensed-story-so-far', 'conversation'],
-          authorityTiers: [2, 3]
+          authorityTiers: [2, 3],
+          isPaid
         });
         if (supplementalCandidates && supplementalCandidates.length > 0) {
           const rerankedSupp = await reranker.rerank({
@@ -759,7 +874,12 @@ ${downstreamContext ? `\n${downstreamContext}` : ''}
 ${beat.beatOutline || beat.action || 'Unspecified'}
 ${(beat.authorNotes || beat.goalHook) ? `- **Author's Notes (Supreme Vision for this Beat):**\n${beat.authorNotes || beat.goalHook}\n` : ''}${beat.instructions ? `- **Beat Instructions:** ${beat.instructions}\n` : ''}${beatClarifications ? `\n<beat_author_clarifications>\n${beatClarifications}\n</beat_author_clarifications>\n` : ''}${foresightBlock ? `\n${foresightBlock}\n` : ''}${revisionBlock ? `\n${revisionBlock}` : ''}
 ${retryFeedback ? `\n### Revision Notes (from previous attempt):\n${retryFeedback}\n` : ''}
-${isRevision ? `Write the revised and improved narrative prose for Beat ${beat.num}.` : `Write the continuous narrative prose for Beat ${beat.num}.`}`;
+${isRevision ? `Write the revised and improved narrative prose for Beat ${beat.num}.` : `Write the continuous narrative prose for Beat ${beat.num} by dramatizing it into immersive literary fiction:
+- Transform the Beat Outline into fully realized narrative paragraphs with sensory atmosphere, physical blocking, spatial grounding, and natural dialogue cadence guided by the Author's Notes.
+- Group related actions, character gestures, and dialogue exchanges into breathing paragraphs.
+- Never output a mechanical line-by-line outline translation.
+- Convert all planned dialogue and delivery cues into natural literary dialogue, action beats, and physical gestures. Never copy delivery cues literally into dialogue tags (e.g. strictly no "said personifying" or "said matter-of-fact").
+- Output ONLY the continuous narrative prose for Beat ${beat.num}.`}`;
 
       if (groqClient?.quotaManager) {
         const cd = config?.cooldownSeconds !== undefined ? config.cooldownSeconds : (process.stdin?.isTTY ? 45 : 0);
@@ -815,6 +935,8 @@ ${isRevision ? `Write the revised and improved narrative prose for Beat ${beat.n
             pastChapterSummaries: pastSummariesForCritic,
             lastProseSnippet: activeLastSnippet,
             planContent,
+            chapterInstructions,
+            globalInstructions: globalInstructionsBlock,
             groqClient,
             sessionId: `chapter_${chapterNum}_beat_${beat.num}`
           });
@@ -829,9 +951,27 @@ ${isRevision ? `Write the revised and improved narrative prose for Beat ${beat.n
             }
           } else {
             criticSpinner.warn(chalk.yellow(`Continuity Critic: ${criticResult.issues.length} issue(s) flagged (${criticResult.severity})`));
-            console.log(chalk.yellow.bold(`\n⚠ Continuity Critic Flagged ${criticResult.issues.length} Issue(s) [Severity: ${criticResult.severity}]:`));
+          }
+
+          // 4-Point Visual Checklist
+          const cl = criticResult.checklist || {
+            planFollowed: true,
+            authorVisionMet: true,
+            instructionsFollowed: true,
+            grammarCorrect: true
+          };
+          const checkMark = (ok) => (ok ? chalk.green('[✓]') : chalk.red('[✗]'));
+          console.log(chalk.bold('\n--- Pre-Review Audit Checklist ---'));
+          console.log(`  ${checkMark(cl.planFollowed)} Plan Followed:        ${cl.planFollowed ? 'All outline steps & dialogue tags executed' : 'Discrepancy with Beat Outline / dialogue tags'}`);
+          console.log(`  ${checkMark(cl.authorVisionMet)} Author Vision:        ${cl.authorVisionMet ? 'Beat purpose and emotional subtext achieved' : 'Author\'s Notes vision/subtext not fully reflected'}`);
+          console.log(`  ${checkMark(cl.instructionsFollowed)} Instructions:         ${cl.instructionsFollowed ? 'Beat & chapter constraints respected' : 'Beat or chapter instructions violated'}`);
+          console.log(`  ${checkMark(cl.grammarCorrect)} Grammar & Spelling:   ${cl.grammarCorrect ? 'No typographical or syntactic errors' : 'Spelling, grammar, or punctuation errors found'}`);
+
+          if (criticResult.issues && criticResult.issues.length > 0) {
+            console.log(chalk.yellow.bold(`\n⚠ Continuity & Plan Critic Flagged ${criticResult.issues.length} Issue(s) [Severity: ${criticResult.severity}]:`));
             criticResult.issues.forEach((issue, idx) => {
-              console.log(chalk.yellow(`  ${idx + 1}. [${issue.type || 'continuity'}] ${issue.description}`));
+              const tag = issue.category || issue.type || 'continuity';
+              console.log(chalk.yellow(`  ${idx + 1}. [${tag}] ${issue.description}`));
               if (issue.quote) {
                 console.log(chalk.dim(`     Quote: "${issue.quote}"`));
               }
@@ -839,8 +979,8 @@ ${isRevision ? `Write the revised and improved narrative prose for Beat ${beat.n
                 console.log(chalk.cyan(`     Fix:   ${issue.fixSuggestion}`));
               }
             });
-            console.log('');
           }
+          console.log('');
         } catch {
           criticSpinner.stop();
         }
@@ -912,6 +1052,62 @@ ${isRevision ? `Write the revised and improved narrative prose for Beat ${beat.n
         // Standard sequential flow
         await setActiveBeat(chapterNum, beat.num + 1, cwd);
         console.log(chalk.green(`\nBeat ${beat.num} accepted and committed to project/chapter-${padded}/chapter.md (earlier beats preserved)`));
+
+        const nextBeatInPlan = beats.find((b) => b.num === beat.num + 1);
+        const totalPlannedBeats = beats.length;
+
+        // Interactive post-beat menu in TTY:
+        if (process.stdin.isTTY) {
+          ensureStdinRaw();
+          const { select } = await import('@inquirer/prompts');
+          const writeChoices = [];
+          if (nextBeatInPlan) {
+            writeChoices.push({
+              name: `Write Next Beat (Beat ${beat.num + 1}${nextBeatInPlan.title ? `: ${nextBeatInPlan.title}` : ''})`,
+              value: 'write_next'
+            });
+          }
+          writeChoices.push(
+            { name: `Plan Next Beat (Beat ${totalPlannedBeats + 1})`, value: 'plan_next' },
+            { name: `End Chapter (finish Chapter ${chapterNum} with ${beat.num} beat(s))`, value: 'end_chapter' },
+            { name: `Pause and return to prompt`, value: 'pause' }
+          );
+
+          let postBeatAction = 'write_next';
+          try {
+            postBeatAction = await select({
+              message: `Beat ${beat.num} written. What would you like to do next?`,
+              choices: writeChoices
+            });
+          } catch {
+            postBeatAction = nextBeatInPlan ? 'write_next' : 'end_chapter';
+          }
+
+          if (postBeatAction === 'pause') {
+            console.log(chalk.yellow(`\nPaused after Beat ${beat.num}. Next beat is Beat ${beat.num + 1}. Resume anytime with /write ${chapterNum}`));
+            return;
+          }
+          if (postBeatAction === 'end_chapter') {
+            console.log(chalk.bold.green(`\nEnding Chapter ${chapterNum} after Beat ${beat.num}...`));
+            await generateChapterSummary({ chapterNum, chapterFile, summaryFile, groqClient, cwd, vectorStore, embedder, config });
+            return;
+          }
+          if (postBeatAction === 'plan_next') {
+            console.log(chalk.bold.cyan(`\nTransitioning to plan Beat ${totalPlannedBeats + 1} for Chapter ${chapterNum}...`));
+            const { runPlanChapterWorkflow } = await import('./planChapter.js');
+            await runPlanChapterWorkflow({
+              chapterArg: `${chapterNum} add`,
+              cwd,
+              groqClient,
+              vectorStore,
+              embedder,
+              reranker,
+              conversationMgr,
+              config
+            });
+            return;
+          }
+        }
       } else if (review.action === 'retry') {
         retryFeedback = review.feedback || 'Improve prose flow, pacing, and sensory engagement.';
       } else if (review.action === 'pause') {
@@ -1047,14 +1243,16 @@ export async function runFullChapterEditWorkflow({
   // Scoped Story Bible RAG for chapter revision
   let ragChunks = [];
   try {
+    const isPaid = Boolean(config?.apiTier === 'paid' || config?.apiTier === 'developer');
     const queryVector = await embedder.embedQuery(editInstructions);
     const candidates = await vectorStore.hybridSearch({
       queryText: editInstructions,
       queryVector,
       vectorTopK: 15,
       bm25TopK: 15,
-      sourceTypes: ['story-bible'],
-      authorityTiers: [1]
+      sourceTypes: isPaid ? ['story-bible', 'story-bible-reference'] : ['story-bible'],
+      authorityTiers: [1],
+      isPaid
     });
     ragChunks = await reranker.rerank({
       queryText: editInstructions,

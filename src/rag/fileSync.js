@@ -35,7 +35,69 @@ export async function scanMarkdownFiles(dir, cwd = process.cwd()) {
   return result;
 }
 
-export async function getTrackedFiles(cwd = process.cwd()) {
+export function isIntendedFreeTierFile(relPath) {
+  const normalized = relPath.replace(/\\/g, '/').toLowerCase();
+
+  // 1. Canonical Story Bible (strictly the 4 core canonical files)
+  const canonicalBibleFiles = new Set([
+    'story-bible/plot-overview.md',
+    'story-bible/plot-overview.txt',
+    'story-bible/characters.md',
+    'story-bible/characters.txt',
+    'story-bible/locations.md',
+    'story-bible/locations.txt',
+    'story-bible/world-and-lore.md',
+    'story-bible/world-and-lore.txt'
+  ]);
+  if (canonicalBibleFiles.has(normalized)) {
+    return true;
+  }
+  if (normalized.startsWith('story-bible/')) {
+    return false;
+  }
+
+  // 2. Project Chapters: strictly project/chapter-XX/{chapter,plan,summary}.{md,txt}
+  const projectMatch = normalized.match(/^project\/chapter-\d+\/([^/]+)$/);
+  if (projectMatch) {
+    const filename = projectMatch[1];
+    const validChapterFilenames = new Set([
+      'chapter.md', 'chapter.txt',
+      'plan.md', 'plan.txt',
+      'summary.md', 'summary.txt'
+    ]);
+    return validChapterFilenames.has(filename);
+  }
+  if (normalized.startsWith('project/')) {
+    return false;
+  }
+
+  // 3. Condensed memory: strictly .condensed/story-so-far.{md,txt}
+  // and .condensed/chapters/chapter-XX/{plan,prose}.{md,txt}
+  if (normalized === '.condensed/story-so-far.md' || normalized === '.condensed/story-so-far.txt') {
+    return true;
+  }
+  const condensedMatch = normalized.match(/^\.condensed\/chapters\/chapter-\d+\/([^/]+)$/);
+  if (condensedMatch) {
+    const filename = condensedMatch[1];
+    return filename === 'plan.md' || filename === 'plan.txt' || filename === 'prose.md' || filename === 'prose.txt';
+  }
+  if (normalized.startsWith('.condensed/')) {
+    return false;
+  }
+
+  // 4. Archive sessions: strictly conversations/archive/session-*.{md,txt}
+  const archiveMatch = normalized.match(/^conversations\/archive\/session-[^/]+\.(md|txt)$/);
+  if (archiveMatch) {
+    return true;
+  }
+  if (normalized.startsWith('conversations/')) {
+    return false;
+  }
+
+  return false;
+}
+
+export async function getTrackedFiles(cwd = process.cwd(), config = {}) {
   const tracked = [];
 
   // 1. story-bible/** (recursive: supports nested lore folders e.g. story-bible/factions/clans.md)
@@ -82,6 +144,16 @@ export async function getTrackedFiles(cwd = process.cwd()) {
     }
   } catch {}
 
+  // Free Tier Filtering:
+  // If apiTier is explicitly 'free' (or when isPaid is false and apiTier is present),
+  // omit any file pasted other than the actual files intended for use in free tier.
+  const isPaid = config?.apiTier === 'paid' || config?.apiTier === 'developer';
+  const isExplicitFreeTier = config?.apiTier === 'free' || (Boolean(config?.apiTier) && !isPaid);
+
+  if (isExplicitFreeTier) {
+    return tracked.filter((relPath) => isIntendedFreeTierFile(relPath));
+  }
+
   return tracked;
 }
 
@@ -90,13 +162,24 @@ export async function syncAllFiles({
   vectorStore,
   embedder,
   config = {},
-  force = false
+  force = false,
+  _repairAttempts = 0
 }) {
   try {
     const state = await loadState(cwd);
     let currentHashes = force ? {} : (state.fileHashes || {});
-    const diskFiles = await getTrackedFiles(cwd);
+    const isPaid = config?.apiTier === 'paid' || config?.apiTier === 'developer';
+    const isExplicitFreeTier = config?.apiTier === 'free' || (Boolean(config?.apiTier) && !isPaid);
+
+    // Get all unscoped files on disk to detect omitted files for free tier reporting
+    const allDiskFiles = await getTrackedFiles(cwd, { apiTier: 'paid' });
+    const diskFiles = await getTrackedFiles(cwd, config);
     const diskFileSet = new Set(diskFiles);
+
+    // Detect omitted files
+    const omittedFiles = isExplicitFreeTier
+      ? allDiskFiles.filter((f) => !diskFileSet.has(f))
+      : [];
 
     let hasChanges = force;
     let indexedCount = 0;
@@ -106,12 +189,19 @@ export async function syncAllFiles({
     if (!force) {
       for (const recordedPath of Object.keys(currentHashes)) {
         if (!diskFileSet.has(recordedPath)) {
-          await vectorStore.deleteBySourcePath(recordedPath);
+          if (vectorStore && typeof vectorStore.deleteBySourcePath === 'function') {
+            await vectorStore.deleteBySourcePath(recordedPath);
+          }
           delete currentHashes[recordedPath];
           hasChanges = true;
           deletedCount++;
         }
       }
+    }
+
+    // If free tier, also purge any reference chunks that might exist in vectorStore
+    if (isExplicitFreeTier && vectorStore && typeof vectorStore.deleteWhere === 'function') {
+      await vectorStore.deleteWhere("source_type = 'story-bible-reference'");
     }
 
     // 2. Detect new or modified files
@@ -122,7 +212,9 @@ export async function syncAllFiles({
 
       if (force || currentHashes[relPath] !== hash) {
         // Re-index this file
-        await vectorStore.deleteBySourcePath(relPath);
+        if (vectorStore && typeof vectorStore.deleteBySourcePath === 'function') {
+          await vectorStore.deleteBySourcePath(relPath);
+        }
 
         const content = await fs.readFile(fullPath, 'utf8');
         const chunks = chunkDocument({
@@ -156,15 +248,35 @@ export async function syncAllFiles({
     if (hasChanges) {
       state.fileHashes = currentHashes;
       await saveState(state, cwd);
-      await vectorStore.rebuildFtsIndex();
+      if (vectorStore && typeof vectorStore.rebuildFtsIndex === 'function') {
+        await vectorStore.rebuildFtsIndex();
+      }
     }
 
-    return { hasChanges, indexedCount, deletedCount };
+    return {
+      hasChanges,
+      indexedCount,
+      deletedCount,
+      omittedCount: omittedFiles.length,
+      omittedFiles
+    };
   } catch (err) {
-    if (vectorStore && typeof vectorStore._isCorruptError === 'function' && vectorStore._isCorruptError(err)) {
+    if (
+      _repairAttempts < 1 &&
+      vectorStore &&
+      typeof vectorStore._isCorruptError === 'function' &&
+      vectorStore._isCorruptError(err)
+    ) {
       console.warn('[fileSync] LanceDB corruption detected during file sync. Auto-recovering index and re-syncing...');
       await vectorStore.repairCorruptedIndex();
-      return await syncAllFiles({ cwd, vectorStore, embedder, config, force: true });
+      return await syncAllFiles({
+        cwd,
+        vectorStore,
+        embedder,
+        config,
+        force: true,
+        _repairAttempts: _repairAttempts + 1
+      });
     }
     throw err;
   }

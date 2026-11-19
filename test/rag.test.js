@@ -160,3 +160,56 @@ test('fileSync tracks hashes and indexes files incrementally', async () => {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('VectorStore repairCorruptedIndex recovers cleanly and syncAllFiles prevents infinite retry loops', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'quillbot-test-corrupt-'));
+  try {
+    const store = new VectorStore({}, tmpDir);
+    await store.init();
+
+    // Create a mock corrupted file in index
+    const corruptFile = path.join(store.dbPath, 'quillbot_chunks.lance');
+    await fs.mkdir(corruptFile, { recursive: true });
+    await fs.writeFile(path.join(corruptFile, 'corrupt.manifest'), 'INVALID_BINARY_DATA', 'utf8');
+
+    // Verify _isCorruptError flags corruption correctly
+    assert.equal(store._isCorruptError(new Error('magic number does not match: [0, 0, 0, 0]')), true);
+    assert.equal(store._isCorruptError(new Error('LanceError(IO): Access is denied')), true);
+    assert.equal(store._isCorruptError(new Error('Something else completely')), false);
+
+    // Run repairCorruptedIndex
+    await store.repairCorruptedIndex();
+
+    // Verify dbPath exists and is clean
+    const dbStat = await fs.stat(store.dbPath);
+    assert.ok(dbStat.isDirectory());
+
+    // Verify syncAllFiles does not loop infinitely on repeated corruption
+    let callCount = 0;
+    const failingStore = {
+      _isCorruptError: () => true,
+      repairCorruptedIndex: async () => { callCount++; },
+      deleteBySourcePath: async () => { throw new Error('magic number does not match'); }
+    };
+    const bibleDir = path.join(tmpDir, 'story-bible');
+    await fs.mkdir(bibleDir, { recursive: true });
+    await fs.writeFile(path.join(bibleDir, 'lore.md'), '# Lore\nAncient text', 'utf8');
+
+    await assert.rejects(
+      async () => {
+        await syncAllFiles({
+          cwd: tmpDir,
+          vectorStore: failingStore,
+          embedder: { embedTexts: async () => [] },
+          config: {}
+        });
+      },
+      /magic number does not match/
+    );
+
+    // Must have attempted repair exactly once and then rethrown, NOT infinite loop
+    assert.equal(callCount, 1);
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
