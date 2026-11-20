@@ -5,10 +5,10 @@
   "activeConversationId": "conv_20261103064907",
   "fileHashes": {},
   "dailyUsage": {
-    "2026-11-16": {
+    "2026-11-20": {
       "openai/gpt-oss-120b": {
-        "tokens": 150,
-        "requests": 1
+        "tokens": 450,
+        "requests": 3
       }
     }
   }

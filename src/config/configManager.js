@@ -19,13 +19,31 @@ export const INVARIANT_TEMPERATURES = {
   temperatureSummaries: 0.1
 };
 
+export const PLANNING_CREATIVITY_TIERS = {
+  off: { temperature: 0.1, label: 'off (0.1) — Strict / Literal execution, zero extrapolation' },
+  low: { temperature: 0.3, label: 'low (0.3) — Guided fidelity, minimal sensory embellishment' },
+  balanced: { temperature: 0.5, label: 'balanced (0.5) — Recommended: Grounded sensory textures & atmospheric depth' },
+  expressive: { temperature: 0.7, label: 'expressive (0.7) — Rich atmospheric cadence & evocative sensory detail' },
+  'highly expressive': { temperature: 0.9, label: 'highly expressive (0.9) — Maximum lyrical atmosphere & vivid scene textures' }
+};
+
+export const PLANNING_CREATIVITY_LEVELS = Object.keys(PLANNING_CREATIVITY_TIERS);
+
+export function resolvePlanningTemperature(level = 'balanced') {
+  const norm = String(level || 'balanced').toLowerCase().trim();
+  if (PLANNING_CREATIVITY_TIERS[norm]) {
+    return PLANNING_CREATIVITY_TIERS[norm].temperature;
+  }
+  return 0.5;
+}
+
 // Permanent Zero-Invention Engine: Creativity is locked to 'off' for all users
 export const CREATIVITY_LEVELS = ['off'];
 export function getCreativityTemperatures() {
   return { ...INVARIANT_TEMPERATURES };
 }
 
-export function getExecutionProfile(workflow = '', config = {}) {
+export function getExecutionProfile(workflow = '', config = {}, overridePlanningCreativity = null) {
   const isPaid = config.apiTier === 'paid' || config.apiTier === 'developer';
   let defaultEffort = String(config.generation?.defaultReasoningEffort || config.defaultReasoningEffort || 'medium').toLowerCase();
   if (!REASONING_LEVELS.includes(defaultEffort)) {
@@ -54,11 +72,18 @@ export function getExecutionProfile(workflow = '', config = {}) {
     workflow === 'EDIT_BEAT' ||
     workflow === 'EDIT_CHAPTER'
   ) {
+    const isPlanning = workflow.startsWith('PLAN_');
     const effort = (isPaid && defaultEffort === 'high') ? 'high' : 'medium';
+    let planTemp = INVARIANT_TEMPERATURES.temperaturePlan;
+    if (isPlanning) {
+      const chosenLevel = overridePlanningCreativity || config.generation?.planningCreativity || config.defaultPlanningCreativity || config.planningCreativity || 'balanced';
+      planTemp = resolvePlanningTemperature(chosenLevel);
+    }
     return {
       reasoningEffort: effort,
       maxTokens: 4096,
-      ...INVARIANT_TEMPERATURES
+      ...INVARIANT_TEMPERATURES,
+      ...(isPlanning ? { temperaturePlan: planTemp } : {})
     };
   }
 
@@ -169,6 +194,8 @@ export function getDefaultConfig() {
     },
     generation: {
       defaultReasoningEffort: 'medium',
+      defaultPlanningCreativity: 'balanced',
+      planningCreativity: 'balanced',
       temperaturePlan: INVARIANT_TEMPERATURES.temperaturePlan,
       temperatureWrite: INVARIANT_TEMPERATURES.temperatureWrite,
       temperatureSummaries: INVARIANT_TEMPERATURES.temperatureSummaries,
@@ -178,6 +205,7 @@ export function getDefaultConfig() {
       slidingChatWindowTurns: 8,
       enableContinuityCritic: true
     },
+    defaultPlanningCreativity: 'balanced',
     editor: defaultEditor
   };
 }
@@ -199,12 +227,18 @@ export async function loadConfig(cwd = process.cwd()) {
       resolvedReasoning = 'medium';
     }
 
+    let resolvedPlanningCreativity = parsed.generation?.planningCreativity || parsed.defaultPlanningCreativity || parsed.planningCreativity || defaults.generation.planningCreativity;
+    if (!PLANNING_CREATIVITY_LEVELS.includes(resolvedPlanningCreativity)) {
+      resolvedPlanningCreativity = 'balanced';
+    }
+
     const config = {
       ...defaults,
       ...parsed,
       projectTitle: parsed.projectTitle || defaults.projectTitle,
       writingStyle: parsed.writingStyle || defaults.writingStyle,
       enhancedWritingStyle: parsed.enhancedWritingStyle || '',
+      defaultPlanningCreativity: resolvedPlanningCreativity,
       apiTier,
       cooldownSeconds: parsed.cooldownSeconds !== undefined ? parsed.cooldownSeconds : defaults.cooldownSeconds,
       rateLimits: parsed.rateLimits || defaults.rateLimits,
@@ -214,10 +248,12 @@ export async function loadConfig(cwd = process.cwd()) {
       generation: {
         ...defaults.generation,
         ...(parsed.generation || {}),
-        temperaturePlan: INVARIANT_TEMPERATURES.temperaturePlan,
+        temperaturePlan: resolvePlanningTemperature(resolvedPlanningCreativity),
         temperatureWrite: INVARIANT_TEMPERATURES.temperatureWrite,
         temperatureSummaries: INVARIANT_TEMPERATURES.temperatureSummaries,
         defaultReasoningEffort: resolvedReasoning,
+        defaultPlanningCreativity: resolvedPlanningCreativity,
+        planningCreativity: resolvedPlanningCreativity,
         creativity: 'off'
       }
     };
@@ -536,6 +572,43 @@ export async function runOnboardingWizard(cwd = process.cwd()) {
     }
   }
 
+  // 5. Select Default Planning Creativity Level (Available to both Free & Paid users)
+  let defaultPlanningCreativity = 'balanced';
+  const planningChoices = [
+    {
+      name: `${chalk.bold('balanced (0.5)')}          — Recommended: Grounded sensory textures & atmospheric depth`,
+      value: 'balanced'
+    },
+    {
+      name: `${chalk.bold('low (0.3)')}               — Guided fidelity, minimal sensory embellishment`,
+      value: 'low'
+    },
+    {
+      name: `${chalk.bold('off (0.1)')}               — Strict / Literal execution, zero extrapolation`,
+      value: 'off'
+    },
+    {
+      name: `${chalk.bold('expressive (0.7)')}        — Rich atmospheric cadence & evocative sensory detail`,
+      value: 'expressive'
+    },
+    {
+      name: `${chalk.bold('highly expressive (0.9)')} — Maximum lyrical atmosphere & vivid scene textures`,
+      value: 'highly expressive'
+    }
+  ];
+
+  if (process.stdin.isTTY) {
+    try {
+      defaultPlanningCreativity = await select({
+        message: 'Default Planning Creativity Level:',
+        choices: planningChoices,
+        default: 'balanced'
+      });
+    } catch {
+      defaultPlanningCreativity = 'balanced';
+    }
+  }
+
   const newConfig = {
     ...defaults,
     apiTier: isPaidTier ? 'paid' : 'free',
@@ -544,6 +617,7 @@ export async function runOnboardingWizard(cwd = process.cwd()) {
     projectTitle: projectTitle.trim() || 'Untitled Novel',
     writingStyle: finalStyle,
     enhancedWritingStyle,
+    defaultPlanningCreativity,
     groqApiKey: finalGroqKey.trim(),
     models: {
       small: smallModel.trim(),
@@ -558,7 +632,9 @@ export async function runOnboardingWizard(cwd = process.cwd()) {
     generation: {
       ...defaults.generation,
       defaultReasoningEffort,
-      temperaturePlan: INVARIANT_TEMPERATURES.temperaturePlan,
+      defaultPlanningCreativity,
+      planningCreativity: defaultPlanningCreativity,
+      temperaturePlan: resolvePlanningTemperature(defaultPlanningCreativity),
       temperatureWrite: INVARIANT_TEMPERATURES.temperatureWrite,
       temperatureSummaries: INVARIANT_TEMPERATURES.temperatureSummaries,
       creativity: 'off'

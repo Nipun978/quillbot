@@ -291,7 +291,9 @@ export async function startRepl({
           console.log(`  Enhanced Style:     ${chalk.green('Active (AI-Enhanced Guide incorporated)')}`);
         }
         const reasoningEffort = config.generation?.defaultReasoningEffort || 'medium';
-        console.log(`  Reasoning Effort:   ${chalk.green(reasoningEffort.toUpperCase())} (Fidelity: STRICT ZERO-INVENTION | Plan temp: 0.1, Write temp: 0.3)`);
+        const planningCreativity = config.generation?.planningCreativity || config.defaultPlanningCreativity || 'balanced';
+        console.log(`  Reasoning Effort:   ${chalk.green(reasoningEffort.toUpperCase())}`);
+        console.log(`  Plan Creativity:    ${chalk.green(planningCreativity)} (Write Fidelity: STRICT ZERO-INVENTION | Write temp: 0.3)`);
         console.log(`  Active Chapter:     ${chalk.green(state.activeChapter || 1)}`);
         console.log(`  Active Beat:        ${chalk.green(state.activeBeat || 1)}`);
         console.log(`  Active Session:     ${chalk.green(conversationMgr.current?.id || 'none')}`);

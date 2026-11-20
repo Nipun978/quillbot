@@ -9,9 +9,18 @@ import {
   GENERATE_BEAT_QUESTIONS_SYSTEM_PROMPT,
   buildHierarchyContext,
   buildStoryBibleContext,
-  buildCreativityDirective
+  buildCreativityDirective,
+  buildPlanningCreativityDirective
 } from '../llm/prompts.js';
-import { loadInstructions, getCreativityTemperatures, getCreativityExecutionProfile, getExecutionProfile } from '../config/configManager.js';
+import {
+  loadInstructions,
+  getCreativityTemperatures,
+  getCreativityExecutionProfile,
+  getExecutionProfile,
+  PLANNING_CREATIVITY_TIERS,
+  PLANNING_CREATIVITY_LEVELS,
+  resolvePlanningTemperature
+} from '../config/configManager.js';
 import { setActiveBeat, loadState } from '../config/stateManager.js';
 import { createBackup } from '../config/backupManager.js';
 import { parseBeatsFromPlan, parseChapterPlanHeader } from './writeChapter.js';
@@ -30,6 +39,47 @@ import {
 
 export function padChapter(num) {
   return String(num).padStart(2, '0');
+}
+
+export async function promptPlanningCreativity(config = {}) {
+  const defaultLevel = config?.generation?.planningCreativity || config?.defaultPlanningCreativity || config?.planningCreativity || 'balanced';
+  if (!process.stdin.isTTY) {
+    return defaultLevel;
+  }
+
+  ensureStdinRaw();
+  const choices = [
+    {
+      name: `${chalk.bold('balanced (0.5)')}          — Recommended: Grounded sensory textures & atmospheric depth`,
+      value: 'balanced'
+    },
+    {
+      name: `${chalk.bold('low (0.3)')}               — Guided fidelity, minimal sensory embellishment`,
+      value: 'low'
+    },
+    {
+      name: `${chalk.bold('off (0.1)')}               — Strict / Literal execution, zero extrapolation`,
+      value: 'off'
+    },
+    {
+      name: `${chalk.bold('expressive (0.7)')}        — Rich atmospheric cadence & evocative sensory detail`,
+      value: 'expressive'
+    },
+    {
+      name: `${chalk.bold('highly expressive (0.9)')} — Maximum lyrical atmosphere & vivid scene textures`,
+      value: 'highly expressive'
+    }
+  ];
+
+  try {
+    return await select({
+      message: `Select Planning Creativity Level [default: ${defaultLevel}]:`,
+      choices,
+      default: defaultLevel
+    });
+  } catch {
+    return defaultLevel;
+  }
 }
 
 function assemblePlanningStyle(config = {}) {
@@ -218,6 +268,94 @@ export async function runEditSingleBeatPlanWorkflow({
     console.log(chalk.bold.cyan(`\n  Adding Beat ${targetNum} to Chapter ${chapterNum} Plan`));
   }
 
+  let beatEditMode = 'generate_prompt';
+  ensureStdinRaw();
+  if (isEditingExisting && !userGuidance && process.stdin.isTTY) {
+    try {
+      beatEditMode = await select({
+        message: `Beat ${targetNum} plan already exists ("${matchedBeat.title}"). How would you like to edit it?`,
+        choices: [
+          { name: '1. Generate with additional prompt (AI re-planning with instructions)', value: 'generate_prompt' },
+          { name: '2. Open in editor (manual edits to beat plan)', value: 'editor' },
+          { name: '← Cancel / Return', value: 'cancel' }
+        ]
+      });
+    } catch {
+      beatEditMode = 'generate_prompt';
+    }
+  }
+
+  if (beatEditMode === 'cancel') {
+    return;
+  }
+
+  if (beatEditMode === 'editor') {
+    const rawToEdit = matchedBeat.rawBlock || `### Beat ${matchedBeat.num}: ${matchedBeat.title}\n- **Characters:** ${matchedBeat.characters || ''}\n- **Setting:** ${matchedBeat.location || ''}\n- **Beat Outline:**\n${matchedBeat.beatOutline || matchedBeat.action || ''}\n- **Author's Notes:** ${matchedBeat.authorNotes || matchedBeat.goalHook || ''}\n- **Beat Instructions:** ${matchedBeat.beatInstructions || ''}`;
+    const editedBeatPlan = await openInEditor(rawToEdit, config.editor);
+
+    console.log('\n' + chalk.bold.magenta(`--- Beat ${targetNum} Plan Preview ---`));
+    printMarkdown(editedBeatPlan);
+
+    const review = await promptReviewWorkflow({
+      draftContent: editedBeatPlan,
+      itemLabel: `Chapter ${chapterNum} Beat ${targetNum} Plan`,
+      allowPause: false,
+      preferredEditor: config.editor,
+      quotaManager: groqClient?.quotaManager,
+      config,
+      model: config.models?.large || 'openai/gpt-oss-120b'
+    });
+
+    if (review.action !== 'accept') {
+      console.log(chalk.yellow(`\nBeat ${targetNum} edits discarded.`));
+      return;
+    }
+
+    const finalBeatPlan = review.content.trim();
+
+    // Update plan.md
+    await fs.mkdir(chapterDir, { recursive: true });
+    await createBackup(planFile, cwd);
+
+    const updatedPlan = updateBeatInPlan(existingPlan, targetNum, finalBeatPlan);
+    await fs.writeFile(planFile, updatedPlan, 'utf8');
+
+    // Condense beat plan in .condensed/chapters/chapter-XX/plan.md
+    const updatedBeats = parseBeatsFromPlan(updatedPlan);
+    const matched = updatedBeats.find((b) => b.num === targetNum) || { num: targetNum, title: `Beat ${targetNum}`, rawBlock: finalBeatPlan };
+    const condenseSpinner = createSpinner(`Condensing Beat ${targetNum} plan with 20B model...`).start();
+    try {
+      await saveCondensedBeatPlan({
+        chapterNum,
+        beatNum: targetNum,
+        beatTitle: matched.title,
+        planText: finalBeatPlan,
+        groqClient,
+        cwd,
+        config
+      });
+      condenseSpinner.succeed(`Beat ${targetNum} plan condensed into .condensed/chapters/chapter-${padded}/plan.md`);
+    } catch (err) {
+      condenseSpinner.fail(`Failed to condense Beat ${targetNum} plan: ${err.message}`);
+    }
+
+    console.log(chalk.green(`\nBeat ${targetNum} saved into project/chapter-${padded}/plan.md`));
+
+    // Sync to LanceDB
+    const syncSpinner = createSpinner('Syncing updated plan to LanceDB...').start();
+    try {
+      await vectorStore.syncFile(planFile, 'project-plan', {
+        chapter_number: chapterNum,
+        authority_tier: 2
+      });
+      syncSpinner.succeed('Updated plan indexed into LanceDB.');
+    } catch (err) {
+      syncSpinner.warn(`LanceDB indexing warning: ${err.message}`);
+    }
+
+    return;
+  }
+
   let guidance = userGuidance;
   ensureStdinRaw();
   if (!guidance && process.stdin.isTTY) {
@@ -265,9 +403,10 @@ export async function runEditSingleBeatPlanWorkflow({
     rollingSummary: conversationMgr?.getRollingSummary ? conversationMgr.getRollingSummary() : ''
   });
 
+  const selectedPlanningCreativity = await promptPlanningCreativity(config);
   const activeStyle = assemblePlanningStyle(config);
-  const profile = getExecutionProfile('PLAN_BEAT', config);
-  const creativityDirective = buildCreativityDirective('off');
+  const profile = getExecutionProfile('PLAN_BEAT', config, selectedPlanningCreativity);
+  const creativityDirective = buildPlanningCreativityDirective(selectedPlanningCreativity);
   const planTemp = profile.temperaturePlan;
   const reasoningEffort = profile.reasoningEffort;
   const maxTokens = profile.maxTokens;
@@ -320,7 +459,10 @@ Generate the streamlined planning blueprint for Beat ${targetNum} matching:
 ### Beat ${targetNum}: [Short Beat Title]
 - **Characters:** [Comma-separated character names matching Story Bible]
 - **Setting:** [Location and time/environment]
-- **Beat Outline:** [Concise, deterministic narrative progression containing ONLY details the author specified. Spoken dialogue must be tagged simply as Speaker to Listener (how): "Verbatim line" (e.g. Debu to Padma (lightly): "You again."). If non-verbal/silent, state Non-verbal / silent interaction: [description]. Never invent greetings, small-talk, or untagged dialogue.]
+- **Beat Outline:**
+1. [Concrete physical action and subtle grounded sensory details (light, weather, texture)]
+2. Speaker to Listener (how): "Verbatim line"
+3. [Physical reaction, non-verbal interaction, or subsequent step]
 - **Author's Notes:** [Captures how and what the author wants to achieve: the emotional texture, subtext, and creative vision for this specific beat.]
 - **Beat Instructions:** [Concise beat-level prose directives: pacing, tone, and emotional distance. NO camera/screenplay jargon.]`;
 
@@ -523,7 +665,7 @@ export async function runPlanChapterWorkflow({
           choices: [
             { name: `1. Edit an already planned beat (Choose from Beats 1–${existingBeats.length})`, value: 'edit_beat' },
             { name: `2. Add a new beat to chapter plan (Beat ${existingBeats.length + 1})`, value: 'add_beat' },
-            { name: `3. Edit / Revise entire chapter plan (with current plan in context)`, value: 'edit_full_plan' },
+            { name: `3. Edit / Revise entire chapter plan (AI prompt re-planning or open in editor)`, value: 'edit_full_plan' },
             { name: `4. Re-plan from scratch (overwrite existing plan)`, value: 'scratch' },
             { name: `← Cancel / Return`, value: 'cancel' }
           ]
@@ -601,6 +743,91 @@ export async function runPlanChapterWorkflow({
       : chalk.bold.cyan(`\n  Planning Chapter ${chapterNum} (project/chapter-${padded}/plan.md)`)
   );
 
+  let fullPlanEditMode = 'generate_prompt';
+  ensureStdinRaw();
+  if (isEditingFullPlan && !userGuidance && process.stdin.isTTY) {
+    try {
+      fullPlanEditMode = await select({
+        message: `Chapter ${chapterNum} plan already exists. How would you like to edit it?`,
+        choices: [
+          { name: '1. Generate with additional prompt (AI re-planning with instructions)', value: 'generate_prompt' },
+          { name: '2. Open in editor (manual edits to plan.md)', value: 'editor' },
+          { name: '← Cancel / Return', value: 'cancel' }
+        ]
+      });
+    } catch {
+      fullPlanEditMode = 'generate_prompt';
+    }
+  }
+
+  if (fullPlanEditMode === 'cancel') {
+    return;
+  }
+
+  if (fullPlanEditMode === 'editor') {
+    const editedPlan = await openInEditor(existingPlan, config.editor);
+
+    console.log('\n' + chalk.bold.magenta(`--- Chapter ${chapterNum} Plan Preview ---`));
+    printMarkdown(editedPlan);
+
+    const review = await promptReviewWorkflow({
+      draftContent: editedPlan,
+      itemLabel: `Chapter ${chapterNum} Plan`,
+      allowPause: false,
+      preferredEditor: config.editor,
+      quotaManager: groqClient?.quotaManager,
+      config,
+      model: config.models?.large || 'openai/gpt-oss-120b'
+    });
+
+    if (review.action !== 'accept') {
+      console.log(chalk.yellow(`\nChapter ${chapterNum} plan edits discarded.`));
+      return;
+    }
+
+    await fs.mkdir(chapterDir, { recursive: true });
+    await createBackup(planFile, cwd);
+    await fs.writeFile(planFile, review.content.trim() + '\n', 'utf8');
+
+    // Condense each beat into .condensed/chapters/chapter-XX/plan.md
+    const parsedBeats = parseBeatsFromPlan(review.content);
+    if (parsedBeats.length > 0) {
+      const condenseSpinner = createSpinner(`Condensing ${parsedBeats.length} beats into .condensed with 20B model...`).start();
+      try {
+        for (const beat of parsedBeats) {
+          await saveCondensedBeatPlan({
+            chapterNum,
+            beatNum: beat.num,
+            beatTitle: beat.title,
+            planText: beat.rawBlock || `${beat.title}: ${beat.action}`,
+            groqClient,
+            cwd,
+            config
+          });
+        }
+        condenseSpinner.succeed(`All ${parsedBeats.length} beats condensed into .condensed/chapters/chapter-${padded}/plan.md`);
+      } catch (err) {
+        condenseSpinner.fail(`Failed to condense beat plans: ${err.message}`);
+      }
+    }
+
+    console.log(chalk.green(`\nChapter ${chapterNum} plan saved to project/chapter-${padded}/plan.md`));
+
+    // Sync to LanceDB
+    const syncSpinner = createSpinner('Syncing updated plan to LanceDB...').start();
+    try {
+      await vectorStore.syncFile(planFile, 'project-plan', {
+        chapter_number: chapterNum,
+        authority_tier: 2
+      });
+      syncSpinner.succeed('Updated plan indexed into LanceDB.');
+    } catch (err) {
+      syncSpinner.warn(`LanceDB indexing warning: ${err.message}`);
+    }
+
+    return;
+  }
+
   let guidance = userGuidance;
   ensureStdinRaw();
   if (!guidance && process.stdin.isTTY) {
@@ -648,10 +875,11 @@ export async function runPlanChapterWorkflow({
     rollingSummary: conversationMgr?.getRollingSummary ? conversationMgr.getRollingSummary() : ''
   });
 
+  const selectedPlanningCreativity = await promptPlanningCreativity(config);
   let finalPlan = '';
   const condensedBeatNums = new Set();
-  const profile = getExecutionProfile('PLAN_CHAPTER', config);
-  const creativityDirective = buildCreativityDirective('off');
+  const profile = getExecutionProfile('PLAN_CHAPTER', config, selectedPlanningCreativity);
+  const creativityDirective = buildPlanningCreativityDirective(selectedPlanningCreativity);
   const planTemp = profile.temperaturePlan;
   const reasoningEffort = profile.reasoningEffort;
   const maxTokens = profile.maxTokens;
@@ -844,7 +1072,10 @@ Generate the streamlined planning blueprint for Beat ${currentBeatNum} matching:
 ### Beat ${currentBeatNum}: [Short Beat Title]
 - **Characters:** [Comma-separated character names matching Story Bible]
 - **Setting:** [Location and time/environment]
-- **Beat Outline:** [Concise, deterministic narrative progression containing ONLY details the author specified. Spoken dialogue must be tagged simply as Speaker to Listener (how): "Verbatim line" (e.g. Debu to Padma (lightly): "You again."). If non-verbal/silent, state Non-verbal / silent interaction: [description]. Never invent greetings, small-talk, or untagged dialogue.]
+- **Beat Outline:**
+1. [Concrete physical action and subtle grounded sensory details (light, weather, texture)]
+2. Speaker to Listener (how): "Verbatim line"
+3. [Physical reaction, non-verbal interaction, or subsequent step]
 - **Author's Notes:** [Captures how and what the author wants to achieve: the emotional texture, subtext, and creative vision for this specific beat.]
 - **Beat Instructions:** [Concise beat-level prose directives: pacing, tone, and emotional distance. NO camera/screenplay jargon.]`;
 

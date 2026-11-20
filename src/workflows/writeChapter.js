@@ -14,7 +14,7 @@ import { createBackup } from '../config/backupManager.js';
 import { setActiveBeat, loadState } from '../config/stateManager.js';
 import { padChapter } from './planChapter.js';
 import { createSpinner } from '../ui/renderer.js';
-import { promptReviewWorkflow } from '../ui/reviewPrompt.js';
+import { promptReviewWorkflow, openInEditor } from '../ui/reviewPrompt.js';
 import { syncAllFiles } from '../rag/fileSync.js';
 import { ensureStdinRaw } from '../ui/ttyManager.js';
 import {
@@ -98,6 +98,17 @@ export function parseBeatsFromPlan(planContent) {
       });
     }
 
+    // Extract numbered outline steps if present
+    const stepsRegex = /^\s*(\d+)\.\s+(.+)$/gm;
+    const outlineSteps = [];
+    let sMatch;
+    while ((sMatch = stepsRegex.exec(outline)) !== null) {
+      outlineSteps.push({
+        stepNum: parseInt(sMatch[1], 10),
+        text: sMatch[2].trim()
+      });
+    }
+
     beats.push({
       num: indices[i].beatNum,
       title: indices[i].title,
@@ -106,6 +117,7 @@ export function parseBeatsFromPlan(planContent) {
       setting,
       action: outline,
       beatOutline: outline,
+      outlineSteps: outlineSteps.length > 0 ? outlineSteps : null,
       goalHook: authorNotes,
       authorNotes,
       instructions,
@@ -335,6 +347,7 @@ Audit the drafted Beat Prose against:
 3. Beat & Chapter Instructions adherence (were pacing, tone, and emotional distance constraints followed?)
 4. Grammar, spelling, and syntax flaws (including robotic/ungrammatical tags like "said personifying" or "said matter-of-fact")
 5. Story Bible canon and scene continuity
+6. Ungrounded physical inventions (check whether the prose manufactured new physical props, unprompted characters, unmentioned room furnishings, or ungrounded physical actions not derived from the plan. Allow natural prose connective tissue).
 
 Return your evaluation strictly as the JSON schema requested in your instructions.`;
 
@@ -388,7 +401,7 @@ Return your evaluation strictly as the JSON schema requested in your instruction
       return true;
     });
 
-    const hasPlanDiscrepancyIssue = issues.some((i) => (i.category || i.type) === 'plan_discrepancy' || (i.category || i.type) === 'raw_dialogue_tags_leaked');
+    const hasPlanDiscrepancyIssue = issues.some((i) => (i.category || i.type) === 'plan_discrepancy' || (i.category || i.type) === 'raw_dialogue_tags_leaked' || (i.category || i.type) === 'ungrounded_physical_invention');
     const checklist = result.checklist && typeof result.checklist === 'object' ? {
       planFollowed: hasPlanDiscrepancyIssue ? false : Boolean(result.checklist.planFollowed !== false || !hasPlanDiscrepancyIssue),
       authorVisionMet: Boolean(result.checklist.authorVisionMet !== false),
@@ -465,6 +478,129 @@ Return your evaluation strictly as the JSON schema requested in your instruction
       skipReason: err.message
     };
   }
+}
+
+async function finalizeAcceptedBeat({
+  chapterNum,
+  padded,
+  beat,
+  finalProse,
+  chapterFile,
+  chapterDir,
+  summaryFile,
+  beats,
+  isTargetedBeat,
+  cwd,
+  groqClient,
+  vectorStore,
+  embedder,
+  config
+}) {
+  await commitBeatToChapter({
+    chapterFile,
+    chapterDir,
+    beatNum: beat.num,
+    finalProse,
+    cwd
+  });
+
+  // Condense beat prose into .condensed/chapters/chapter-XX/prose.md
+  const condenseSpinner = createSpinner(`Condensing Beat ${beat.num} prose with 20B model...`).start();
+  try {
+    await saveCondensedBeatProse({
+      chapterNum,
+      beatNum: beat.num,
+      beatTitle: beat.title,
+      proseText: finalProse,
+      planText: beat.rawBlock || beat.action || '',
+      groqClient,
+      cwd,
+      config
+    });
+    condenseSpinner.succeed(`Beat ${beat.num} prose condensed into .condensed/chapters/chapter-${padded}/prose.md`);
+  } catch (err) {
+    condenseSpinner.fail(`Failed to condense Beat ${beat.num} prose: ${err.message}`);
+  }
+
+  if (isTargetedBeat) {
+    console.log(chalk.green(`\nBeat ${beat.num} rewritten and updated in project/chapter-${padded}/chapter.md`));
+
+    // Check if all beats in the chapter are completed or if summary.md already exists
+    const { completedNums: updatedCompleted } = await getCompletedBeatsInChapter(chapterFile);
+    const allCompleted = beats.every((b) => updatedCompleted.includes(b.num));
+    let summaryExists = false;
+    try {
+      await fs.access(summaryFile);
+      summaryExists = true;
+    } catch {}
+
+    if (allCompleted || summaryExists) {
+      console.log(chalk.cyan(`\nRe-generating chapter summary to reflect rewritten Beat ${beat.num}...`));
+      await generateChapterSummary({ chapterNum, chapterFile, summaryFile, groqClient, cwd, vectorStore, embedder, config });
+    }
+
+    return { done: true };
+  }
+
+  // Standard sequential flow
+  await setActiveBeat(chapterNum, beat.num + 1, cwd);
+  console.log(chalk.green(`\nBeat ${beat.num} accepted and committed to project/chapter-${padded}/chapter.md (earlier beats preserved)`));
+
+  const nextBeatInPlan = beats.find((b) => b.num === beat.num + 1);
+  const totalPlannedBeats = beats.length;
+
+  // Interactive post-beat menu in TTY:
+  if (process.stdin.isTTY) {
+    ensureStdinRaw();
+    const { select } = await import('@inquirer/prompts');
+    const writeChoices = [];
+    if (nextBeatInPlan) {
+      writeChoices.push({
+        name: `Write Next Beat (Beat ${beat.num + 1}${nextBeatInPlan.title ? `: ${nextBeatInPlan.title}` : ''})`,
+        value: 'write_next'
+      });
+    }
+    writeChoices.push(
+      { name: `Plan Next Beat (Beat ${totalPlannedBeats + 1})`, value: 'plan_next' },
+      { name: `End Chapter (finish Chapter ${chapterNum} with ${beat.num} beat(s))`, value: 'end_chapter' },
+      { name: `Pause and return to prompt`, value: 'pause' }
+    );
+
+    let postBeatAction = 'write_next';
+    try {
+      postBeatAction = await select({
+        message: `Beat ${beat.num} written. What would you like to do next?`,
+        choices: writeChoices
+      });
+    } catch {
+      postBeatAction = nextBeatInPlan ? 'write_next' : 'end_chapter';
+    }
+
+    if (postBeatAction === 'pause') {
+      console.log(chalk.yellow(`\nPaused after Beat ${beat.num}. Next beat is Beat ${beat.num + 1}. Resume anytime with /write ${chapterNum}`));
+      return { done: true };
+    }
+    if (postBeatAction === 'end_chapter') {
+      console.log(chalk.bold.green(`\nEnding Chapter ${chapterNum} after Beat ${beat.num}...`));
+      await generateChapterSummary({ chapterNum, chapterFile, summaryFile, groqClient, cwd, vectorStore, embedder, config });
+      return { done: true };
+    }
+    if (postBeatAction === 'plan_next') {
+      console.log(chalk.bold.cyan(`\nTransitioning to plan Beat ${totalPlannedBeats + 1} for Chapter ${chapterNum}...`));
+      const { runPlanChapterWorkflow } = await import('./planChapter.js');
+      await runPlanChapterWorkflow({
+        chapterArg: `${chapterNum} add`,
+        cwd,
+        groqClient,
+        vectorStore,
+        embedder,
+        config
+      });
+      return { done: true };
+    }
+  }
+
+  return { done: false };
 }
 
 export async function runWriteChapterWorkflow({
@@ -594,7 +730,7 @@ export async function runWriteChapterWorkflow({
             choices: [
               { name: `1. Edit a specific beat (Choose Beat 1–${beats.length})`, value: 'single_beat' },
               { name: `2. Revise full chapter beat-by-beat (sequential revision with prior drafts)`, value: 'all_beats' },
-              { name: `3. Full chapter manuscript edit (AI editorial pass on full chapter.md)`, value: 'full_manuscript' },
+              { name: `3. Full chapter manuscript edit (AI prompt generation or open in editor)`, value: 'full_manuscript' },
               { name: `4. Re-generate canonical chapter summary & sync`, value: 'summary_only' },
               { name: `← Cancel / Return`, value: 'cancel' }
             ]
@@ -675,7 +811,82 @@ export async function runWriteChapterWorkflow({
     console.log(chalk.dim(`  Location:   ${beat.location || 'Unspecified'}`));
     console.log(chalk.dim(`  Action:     ${beat.action || 'Unspecified'}\n`));
 
-    // If editing existing beat and user did not pass instructions in CLI, ask interactively
+    // If editing existing beat, provide choice between AI prompt re-generation or opening in editor
+    let beatEditMode = 'generate_prompt';
+    ensureStdinRaw();
+    if (isRevision && !userInstruction && process.stdin.isTTY) {
+      try {
+        const { select } = await import('@inquirer/prompts');
+        beatEditMode = await select({
+          message: `Beat ${beat.num} prose already exists. How would you like to edit it?`,
+          choices: [
+            { name: '1. Generate with additional prompt (AI revision with instructions)', value: 'generate_prompt' },
+            { name: '2. Open in editor (manual edits to beat prose)', value: 'editor' },
+            { name: '← Skip / Keep current prose', value: 'skip' }
+          ]
+        });
+      } catch {
+        beatEditMode = 'generate_prompt';
+      }
+    }
+
+    if (beatEditMode === 'skip') {
+      console.log(chalk.yellow(`\nSkipping Beat ${beat.num}. Existing prose kept intact.`));
+      continue;
+    }
+
+    if (beatEditMode === 'editor') {
+      const editedProse = await openInEditor(existingBeatProse, config.editor);
+
+      console.log(chalk.bold.green(`\nEdited Beat ${beat.num} Prose Preview:\n`));
+      console.log(chalk.white(editedProse));
+
+      const review = await promptReviewWorkflow({
+        draftContent: editedProse,
+        itemLabel: `Beat ${beat.num} Prose`,
+        allowPause: true,
+        preferredEditor: config.editor,
+        quotaManager: groqClient?.quotaManager,
+        config,
+        model: config.models?.large || 'openai/gpt-oss-120b'
+      });
+
+      if (review.action === 'pause') {
+        if (!isTargetedBeat) {
+          await setActiveBeat(chapterNum, beat.num, cwd);
+        }
+        console.log(chalk.yellow(`\nPaused at Beat ${beat.num}. Progress saved. You can resume with /write ${chapterNum}`));
+        return;
+      }
+      if (review.action !== 'accept') {
+        console.log(chalk.yellow(`\nBeat ${beat.num} edits discarded.`));
+        continue;
+      }
+
+      const res = await finalizeAcceptedBeat({
+        chapterNum,
+        padded,
+        beat,
+        finalProse: review.content.trim(),
+        chapterFile,
+        chapterDir,
+        summaryFile,
+        beats,
+        isTargetedBeat,
+        cwd,
+        groqClient,
+        vectorStore,
+        embedder,
+        config
+      });
+
+      if (res.done) {
+        return;
+      }
+      continue;
+    }
+
+    // If editing existing beat with prompt and user did not pass instructions in CLI, ask interactively
     let beatEditNotes = userInstruction;
     ensureStdinRaw();
     if (isRevision && !beatEditNotes && process.stdin.isTTY) {
@@ -1001,113 +1212,27 @@ ${isRevision ? `Write the revised and improved narrative prose for Beat ${beat.n
 
       if (review.action === 'accept') {
         beatAccepted = true;
-        const finalProse = review.content.trim();
-
-        // Safely commit beat: backup chapter.md, replace beat if exists or append cleanly
-        await commitBeatToChapter({
+        const res = await finalizeAcceptedBeat({
+          chapterNum,
+          padded,
+          beat,
+          finalProse: review.content.trim(),
           chapterFile,
           chapterDir,
-          beatNum: beat.num,
-          finalProse,
-          cwd
+          summaryFile,
+          beats,
+          isTargetedBeat,
+          cwd,
+          groqClient,
+          vectorStore,
+          embedder,
+          config
         });
 
-        // Condense beat prose into .condensed/chapters/chapter-XX/prose.md
-        const condenseSpinner = createSpinner(`Condensing Beat ${beat.num} prose with 20B model...`).start();
-        try {
-          await saveCondensedBeatProse({
-            chapterNum,
-            beatNum: beat.num,
-            beatTitle: beat.title,
-            proseText: finalProse,
-            groqClient,
-            cwd,
-            config
-          });
-          condenseSpinner.succeed(`Beat ${beat.num} prose condensed into .condensed/chapters/chapter-${padded}/prose.md`);
-        } catch (err) {
-          condenseSpinner.fail(`Failed to condense Beat ${beat.num} prose: ${err.message}`);
-        }
-
-        if (isTargetedBeat) {
-          console.log(chalk.green(`\nBeat ${beat.num} rewritten and updated in project/chapter-${padded}/chapter.md`));
-
-          // Check if all beats in the chapter are completed or if summary.md already exists
-          const { completedNums: updatedCompleted } = await getCompletedBeatsInChapter(chapterFile);
-          const allCompleted = beats.every((b) => updatedCompleted.includes(b.num));
-          let summaryExists = false;
-          try {
-            await fs.access(summaryFile);
-            summaryExists = true;
-          } catch {}
-
-          if (allCompleted || summaryExists) {
-            console.log(chalk.cyan(`\nRe-generating chapter summary to reflect rewritten Beat ${beat.num}...`));
-            await generateChapterSummary({ chapterNum, chapterFile, summaryFile, groqClient, cwd, vectorStore, embedder, config });
-          }
-
+        if (res.done) {
           return;
         }
-
-        // Standard sequential flow
-        await setActiveBeat(chapterNum, beat.num + 1, cwd);
-        console.log(chalk.green(`\nBeat ${beat.num} accepted and committed to project/chapter-${padded}/chapter.md (earlier beats preserved)`));
-
-        const nextBeatInPlan = beats.find((b) => b.num === beat.num + 1);
-        const totalPlannedBeats = beats.length;
-
-        // Interactive post-beat menu in TTY:
-        if (process.stdin.isTTY) {
-          ensureStdinRaw();
-          const { select } = await import('@inquirer/prompts');
-          const writeChoices = [];
-          if (nextBeatInPlan) {
-            writeChoices.push({
-              name: `Write Next Beat (Beat ${beat.num + 1}${nextBeatInPlan.title ? `: ${nextBeatInPlan.title}` : ''})`,
-              value: 'write_next'
-            });
-          }
-          writeChoices.push(
-            { name: `Plan Next Beat (Beat ${totalPlannedBeats + 1})`, value: 'plan_next' },
-            { name: `End Chapter (finish Chapter ${chapterNum} with ${beat.num} beat(s))`, value: 'end_chapter' },
-            { name: `Pause and return to prompt`, value: 'pause' }
-          );
-
-          let postBeatAction = 'write_next';
-          try {
-            postBeatAction = await select({
-              message: `Beat ${beat.num} written. What would you like to do next?`,
-              choices: writeChoices
-            });
-          } catch {
-            postBeatAction = nextBeatInPlan ? 'write_next' : 'end_chapter';
-          }
-
-          if (postBeatAction === 'pause') {
-            console.log(chalk.yellow(`\nPaused after Beat ${beat.num}. Next beat is Beat ${beat.num + 1}. Resume anytime with /write ${chapterNum}`));
-            return;
-          }
-          if (postBeatAction === 'end_chapter') {
-            console.log(chalk.bold.green(`\nEnding Chapter ${chapterNum} after Beat ${beat.num}...`));
-            await generateChapterSummary({ chapterNum, chapterFile, summaryFile, groqClient, cwd, vectorStore, embedder, config });
-            return;
-          }
-          if (postBeatAction === 'plan_next') {
-            console.log(chalk.bold.cyan(`\nTransitioning to plan Beat ${totalPlannedBeats + 1} for Chapter ${chapterNum}...`));
-            const { runPlanChapterWorkflow } = await import('./planChapter.js');
-            await runPlanChapterWorkflow({
-              chapterArg: `${chapterNum} add`,
-              cwd,
-              groqClient,
-              vectorStore,
-              embedder,
-              reranker,
-              conversationMgr,
-              config
-            });
-            return;
-          }
-        }
+        break;
       } else if (review.action === 'retry') {
         retryFeedback = review.feedback || 'Improve prose flow, pacing, and sensory engagement.';
       } else if (review.action === 'pause') {
@@ -1221,6 +1346,83 @@ export async function runFullChapterEditWorkflow({
   }
 
   let editInstructions = userInstruction;
+  let fullManuscriptEditMode = 'generate_prompt';
+  ensureStdinRaw();
+  if (!userInstruction && process.stdin.isTTY) {
+    try {
+      const { select } = await import('@inquirer/prompts');
+      fullManuscriptEditMode = await select({
+        message: `Chapter ${chapterNum} manuscript already exists. How would you like to edit it?`,
+        choices: [
+          { name: '1. Generate with additional prompt (AI editorial pass on full manuscript)', value: 'generate_prompt' },
+          { name: '2. Open in editor (manual edits to chapter.md)', value: 'editor' },
+          { name: '← Cancel / Return', value: 'cancel' }
+        ]
+      });
+    } catch {
+      fullManuscriptEditMode = 'generate_prompt';
+    }
+  }
+
+  if (fullManuscriptEditMode === 'cancel') {
+    return;
+  }
+
+  if (fullManuscriptEditMode === 'editor') {
+    const editedChapter = await openInEditor(chapterRaw, config.editor);
+
+    console.log(chalk.bold.green(`\nEdited Chapter ${chapterNum} Manuscript Preview:\n`));
+    console.log(chalk.white(editedChapter.slice(0, 500) + (editedChapter.length > 500 ? '\n...(truncated preview)...' : '')));
+
+    const review = await promptReviewWorkflow({
+      draftContent: editedChapter,
+      itemLabel: `Chapter ${chapterNum} Manuscript`,
+      allowPause: false,
+      preferredEditor: config.editor,
+      quotaManager: groqClient?.quotaManager,
+      config,
+      model: config.models?.large || 'openai/gpt-oss-120b'
+    });
+
+    if (review.action !== 'accept') {
+      console.log(chalk.yellow(`\nChapter ${chapterNum} revision discarded. Original manuscript kept intact.`));
+      return;
+    }
+
+    await createBackup(chapterFile, cwd);
+    const { header, beatsMap } = parseChapterBeats(review.content);
+    const planBeats = planContent ? parseBeatsFromPlan(planContent) : [];
+    if (beatsMap.size > 0) {
+      await fs.writeFile(chapterFile, serializeChapterBeats(header, beatsMap), 'utf8');
+
+      // Re-condense revised beats into .condensed/chapters/chapter-XX/prose.md
+      const condenseSpinner = createSpinner(`Re-condensing ${beatsMap.size} revised beats with 20B model...`).start();
+      try {
+        for (const [beatNum, beatProse] of beatsMap.entries()) {
+          const matchedPlanBeat = planBeats.find((b) => b.num === beatNum);
+          await saveCondensedBeatProse({
+            chapterNum,
+            beatNum,
+            beatTitle: matchedPlanBeat?.title || `Scene ${beatNum}`,
+            proseText: beatProse,
+            planText: matchedPlanBeat?.rawBlock || matchedPlanBeat?.action || '',
+            groqClient,
+            cwd,
+            config
+          });
+        }
+        condenseSpinner.succeed(`Revised beats condensed into .condensed/chapters/chapter-${padded}/prose.md`);
+      } catch (err) {
+        condenseSpinner.fail(`Failed to re-condense revised beats: ${err.message}`);
+      }
+    } else {
+      await fs.writeFile(chapterFile, review.content.trim() + '\n', 'utf8');
+    }
+    console.log(chalk.green(`\nChapter ${chapterNum} updated in project/chapter-${padded}/chapter.md`));
+    await generateChapterSummary({ chapterNum, chapterFile, summaryFile, groqClient, cwd, vectorStore, embedder, config });
+    return;
+  }
+
   ensureStdinRaw();
   if (!editInstructions && process.stdin.isTTY) {
     try {
@@ -1363,6 +1565,7 @@ Revise and polish Chapter ${chapterNum} according to the editorial direction. El
             beatNum,
             beatTitle: matchedPlanBeat?.title || `Scene ${beatNum}`,
             proseText: beatProse,
+            planText: matchedPlanBeat?.rawBlock || matchedPlanBeat?.action || '',
             groqClient,
             cwd,
             config

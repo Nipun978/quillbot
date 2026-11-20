@@ -153,12 +153,20 @@ export async function saveCondensedBeatPlan({
   // Fallback if model output is empty, API call failed, or reasoning exhausted into a mid-sentence fragment
   if (isTruncatedOrEmptyCondensed(condensed, prefixRegex)) {
     const fallbackClean = planText.replace(/^### Beat \d+:.*?\n/, '').replace(/\n+/g, ' ').slice(0, 120).trim();
-    condensed = `${fallbackClean}...`;
+    condensed = `- **Facts & Milestones:**\n  1. ${fallbackClean}...\n- **Key Dialogue & Interactions:**\n  - Tagged interactions from Beat ${beatNum} outline.\n- **Sensory & Atmospheric Anchors:**\n  - Grounded setting and atmosphere from Beat ${beatNum} plan.`;
   }
 
   // Ensure consistent label
   condensed = condensed.replace(prefixRegex, '').trim();
-  const formattedBeatText = `Beat ${beatNum} (${beatTitle || 'Scene'}): ${condensed}`;
+  const label = `Beat ${beatNum} (${beatTitle || 'Scene'}):`;
+  let formattedBeatText = '';
+  if (condensed.startsWith(label)) {
+    formattedBeatText = condensed;
+  } else if (condensed.startsWith('- **Facts & Milestones:**') || condensed.startsWith('- **')) {
+    formattedBeatText = `${label}\n${condensed}`;
+  } else {
+    formattedBeatText = `${label} ${condensed}`;
+  }
 
   // Read existing plan.md or initialize
   let currentFile = '';
@@ -185,12 +193,14 @@ export async function saveCondensedBeatPlan({
 /**
  * Requirement 3: Condenses accepted beat prose using 20B model and stores it in
  * .condensed/chapters/chapter-XX/prose.md under the beat label.
+ * Cross-references Beat Plan (blueprint) and Narrative Prose (manuscript).
  */
 export async function saveCondensedBeatProse({
   chapterNum,
   beatNum,
   beatTitle = '',
   proseText = '',
+  planText = '',
   groqClient,
   cwd = process.cwd(),
   config = {}
@@ -202,18 +212,47 @@ export async function saveCondensedBeatProse({
 
   const cleanProse = proseText.replace(/<!-- BEAT \d+ -->/g, '').trim();
 
+  // If planText is not passed, attempt to look it up from condensed plan or full plan
+  let effectivePlanText = (planText || '').trim();
+  if (!effectivePlanText) {
+    try {
+      const plans = await getCondensedBeatPlans(chapterNum, cwd);
+      const match = plans.find((b) => b.num === beatNum);
+      if (match && match.text) {
+        effectivePlanText = match.text;
+      }
+    } catch {}
+  }
+  if (!effectivePlanText) {
+    try {
+      const chPadded = padChapter(chapterNum);
+      const fullPlanPath = path.join(cwd, 'project', `chapter-${chPadded}`, 'plan.md');
+      const fullPlan = await fs.readFile(fullPlanPath, 'utf8');
+      const { parseBeatsFromPlan } = await import('../workflows/planChapter.js');
+      const allBeats = parseBeatsFromPlan(fullPlan);
+      const target = allBeats.find((b) => b.num === beatNum);
+      if (target) {
+        effectivePlanText = target.rawBlock || target.action || '';
+      }
+    } catch {}
+  }
+
   let condensed = '';
   const creativity = config?.generation?.creativity || config?.creativity || 'medium';
   const temps = getCreativityTemperatures(creativity);
   if (groqClient && cleanProse) {
     try {
+      const planSection = effectivePlanText
+        ? `--- BEAT PLAN (Author's Blueprint) ---\n${effectivePlanText.slice(0, 3000)}\n\n`
+        : '';
+
       condensed = await groqClient.chatCompletion({
         model: 'small', // Requirement 6: Use 20B model
         messages: [
           { role: 'system', content: CONDENSE_BEAT_PROSE_SYSTEM_PROMPT },
           {
             role: 'user',
-            content: `Chapter ${chapterNum} Beat ${beatNum}${beatTitle ? ` (${beatTitle})` : ''} Narrative Prose to condense:\n\n${cleanProse.slice(-3500)}`
+            content: `Chapter ${chapterNum} Beat ${beatNum}${beatTitle ? ` (${beatTitle})` : ''} to condense:\n\n${planSection}--- NARRATIVE PROSE (Manuscript) ---\n${cleanProse.slice(-3500)}`
           }
         ],
         temperature: temps.temperatureSummaries,
@@ -232,12 +271,21 @@ export async function saveCondensedBeatProse({
 
   // Fallback if model output is empty, API call failed, or truncated fragment
   if (isTruncatedOrEmptyCondensed(condensed, prefixRegex)) {
-    condensed = `${cleanProse.slice(0, 120).replace(/\n+/g, ' ').trim()}...`;
+    const fallbackFacts = cleanProse.slice(0, 120).replace(/\n+/g, ' ').trim();
+    condensed = `- **Facts & Milestones:**\n  1. ${fallbackFacts}...\n- **Key Dialogue & Interactions:**\n  - Dialogue and actions as written in Beat ${beatNum}.\n- **Sensory & Atmospheric Anchors:**\n  - Atmospheric and environmental continuity preserved.`;
   }
 
   // Ensure consistent label
   condensed = condensed.replace(prefixRegex, '').trim();
-  const formattedProseText = `Beat ${beatNum} (${beatTitle || 'Scene'}): ${condensed}`;
+  const label = `Beat ${beatNum} (${beatTitle || 'Scene'}):`;
+  let formattedProseText = '';
+  if (condensed.startsWith(label)) {
+    formattedProseText = condensed;
+  } else if (condensed.startsWith('- **Facts & Milestones:**') || condensed.startsWith('- **')) {
+    formattedProseText = `${label}\n${condensed}`;
+  } else {
+    formattedProseText = `${label} ${condensed}`;
+  }
 
   // Read existing prose.md or initialize
   let currentFile = '';
@@ -341,8 +389,8 @@ export async function updateStorySoFar({
 
   if (isTruncatedOrEmptyCondensed(body)) {
     const sentences = summaryText ? summaryText.replace(/\n+/g, ' ').split(/(?<=[.!?])\s+/).filter(Boolean) : [];
-    const list = sentences.slice(0, 5).map((s, idx) => `${idx + 1}. ${s.trim()}`).join('\n');
-    body = `${list || `1. Events of Chapter ${chapterNum}.`}\n- **End State:** Chapter ${chapterNum} concluded.`;
+    const list = sentences.slice(0, 5).map((s, idx) => `  ${idx + 1}. ${s.trim()}`).join('\n');
+    body = `- **Facts & Milestones:**\n${list || `  1. Events of Chapter ${chapterNum} concluded.`}\n- **Key Dialogue & Interactions:**\n  - Key dialogues and interactions in Chapter ${chapterNum}.\n- **Sensory & Atmospheric Anchors:**\n  - Atmospheric and environmental continuity preserved.\n- **End State:** Chapter ${chapterNum} concluded.`;
   }
 
   // Strip redundant leading markdown header if generated by LLM
